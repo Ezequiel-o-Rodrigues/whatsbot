@@ -5,6 +5,7 @@ import dataclasses
 import json
 import logging
 import mimetypes
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -13,6 +14,8 @@ from openai import OpenAI, AsyncOpenAI
 
 from agent.memory import ContactMemory, TagRegistry, _build_image_content
 from agent.tools import CORE_TOOLS
+from agent import group_mentions, agno_engine, agent_factory
+from config.settings import LLM_API_BASE_URL
 from db.repositories import message_repo, contact_repo, tool_override_repo
 from agent.execution import track_step
 from plugins.context import ToolContext, PromptContext
@@ -45,10 +48,12 @@ class AgentHandler:
         max_context_messages: int = 10,
         inactivity_timeout_min: int = 30,
         model: str = "deepseek/deepseek-v4-pro",
-        audio_model: str = "google/gemini-3-flash-preview",
-        image_model: str = "google/gemini-3-flash-preview",
+        audio_model: str = "google/gemini-2.5-flash",
+        image_model: str = "google/gemini-2.5-flash",
+        document_model: str = "google/gemini-2.5-flash",
         pricing_fn=None,
         default_ai_enabled: bool = True,
+        ai_engine_enabled: bool = False,
     ):
         self.api_key = api_key
         self.system_prompt = system_prompt
@@ -57,7 +62,12 @@ class AgentHandler:
         self.model = model
         self.audio_model = audio_model
         self.image_model = image_model
+        self.document_model = document_model
         self.default_ai_enabled = default_ai_enabled
+        # When True, prompt/model/tools are resolved per-request from the DB
+        # (config-in-DB, see agent.agent_factory) instead of the in-code values.
+        # Off → legacy behaviour (full parity).
+        self.ai_engine_enabled = ai_engine_enabled
         self._contacts: dict[str, ContactMemory] = {}
         self._client: OpenAI | None = None
         self._async_client: AsyncOpenAI | None = None
@@ -133,6 +143,21 @@ class AgentHandler:
         """Register tools from a plugin. Called by the plugin loader."""
         for schema, executor in tools:
             self._register_tool(schema, executor, plugin_id=plugin_id)
+
+    def register_ai_tools(
+        self,
+        tools: list[tuple[dict, callable]],
+    ) -> int:
+        """Register code-in-DB tools (``ai_tools``). Returns the count registered.
+
+        Called by ``agent.ai_tool_installer`` after core + plugin tools, so the
+        registry's collision no-op gives code precedence over the DB. Tagged with
+        ``plugin_id=None`` (same as core) — identity is the tool ``name``.
+        """
+        before = len(self._tool_executors)
+        for schema, executor in tools:
+            self._register_tool(schema, executor, plugin_id=None)
+        return len(self._tool_executors) - before
 
     def register_plugin_prompts(
         self,
@@ -262,11 +287,45 @@ class AgentHandler:
                          phone, call_type, model, total_tokens, cost_usd)
         except Exception as e:
             logger.warning("Failed to record usage: %s", e)
+        # Trigger a low-balance check after every billable call. The monitor
+        # rate-limits actual fetches so this is cheap on a hot path.
+        try:
+            from server import balance_monitor
+            balance_monitor.trigger_check_async()
+        except Exception:
+            pass
+
+    def _record_usage_tokens(self, phone: str, call_type: str, model: str,
+                             prompt_tokens: int, completion_tokens: int,
+                             total_tokens: int) -> None:
+        """Record usage from explicit token counts (AGNO metrics path).
+
+        Mirrors ``_record_usage`` but takes raw token numbers instead of an
+        OpenAI response object, since the AGNO engine reports usage via
+        ``RunMetrics`` rather than a ``response.usage`` attribute.
+        """
+        try:
+            cost_usd = 0.0
+            if self.pricing_fn:
+                prompt_price, completion_price = self.pricing_fn(model)
+                cost_usd = (prompt_tokens * prompt_price) + (completion_tokens * completion_price)
+            contact = self._get_contact(phone)
+            contact.add_usage(call_type, model, prompt_tokens, completion_tokens,
+                              total_tokens, cost_usd)
+            logger.debug("Usage recorded for %s: %s %s tokens=%d cost=%.6f",
+                         phone, call_type, model, total_tokens, cost_usd)
+        except Exception as e:
+            logger.warning("Failed to record usage: %s", e)
+        try:
+            from server import balance_monitor
+            balance_monitor.trigger_check_async()
+        except Exception:
+            pass
 
     def _get_client(self) -> OpenAI:
         if self._client is None or self._client.api_key != self.api_key:
             self._client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
+                base_url=LLM_API_BASE_URL,
                 api_key=self.api_key,
             )
         return self._client
@@ -274,7 +333,7 @@ class AgentHandler:
     def _get_async_client(self) -> AsyncOpenAI:
         if self._async_client is None or self._async_client.api_key != self.api_key:
             self._async_client = AsyncOpenAI(
-                base_url="https://openrouter.ai/api/v1",
+                base_url=LLM_API_BASE_URL,
                 api_key=self.api_key,
             )
         return self._async_client
@@ -288,8 +347,10 @@ class AgentHandler:
         model: str | None = None,
         audio_model: str | None = None,
         image_model: str | None = None,
+        document_model: str | None = None,
         split_messages: bool | None = None,
         default_ai_enabled: bool | None = None,
+        ai_engine_enabled: bool | None = None,
     ):
         if api_key is not None:
             self.api_key = api_key
@@ -307,10 +368,14 @@ class AgentHandler:
             self.audio_model = audio_model
         if image_model is not None:
             self.image_model = image_model
+        if document_model is not None:
+            self.document_model = document_model
         if split_messages is not None:
             self.split_messages = split_messages
         if default_ai_enabled is not None:
             self.default_ai_enabled = default_ai_enabled
+        if ai_engine_enabled is not None:
+            self.ai_engine_enabled = ai_engine_enabled
 
     def transcribe_audio(self, audio_path: str, phone: str = "") -> str:
         """Transcribe an audio file using the configured audio model."""
@@ -417,14 +482,220 @@ class AgentHandler:
             track_step("error", {"error": str(e), "phase": "image_description"}, status="error")
             return ""
 
+    # Plain-text document extensions read directly from disk (no LLM needed).
+    _TEXT_DOC_EXTS = {
+        "txt", "text", "md", "markdown", "csv", "tsv", "log", "json", "xml",
+        "html", "htm", "yaml", "yml", "ini", "cfg", "conf", "srt", "vtt", "rtf",
+    }
+    # Max characters of locally-extracted text fed back as the "transcription".
+    _DOC_TEXT_LIMIT = 20000
+
+    @staticmethod
+    def _doc_kind(file_name: str, path: "Path", mimetype: str) -> str:
+        """Classify a document into pdf | docx | text | unsupported.
+
+        Extension (from the original filename first, then the on-disk path)
+        wins; mimetype is the fallback since GOWA's auto-download path is often
+        UUID-based without a usable suffix.
+        """
+        ext = ""
+        for cand in (file_name, str(path)):
+            if cand:
+                e = Path(cand).suffix.lower().lstrip(".")
+                if e:
+                    ext = e
+                    break
+        mt = (mimetype or "").lower()
+        if ext == "pdf" or "pdf" in mt:
+            return "pdf"
+        if ext == "docx" or "wordprocessingml" in mt:
+            return "docx"
+        if (ext in AgentHandler._TEXT_DOC_EXTS or mt.startswith("text/")
+                or mt in ("application/json", "application/xml")):
+            return "text"
+        return "unsupported"
+
+    @staticmethod
+    def _extract_docx_text(p: "Path") -> str:
+        """Extract visible text from a .docx (zip of XML) using stdlib only."""
+        import zipfile
+        import html as _html
+        try:
+            with zipfile.ZipFile(p) as z:
+                xml = z.read("word/document.xml").decode("utf-8", "ignore")
+        except Exception as e:
+            logger.warning("docx extraction failed for %s: %s", p, e)
+            return ""
+        # Paragraph + line breaks → newlines, then strip every tag.
+        xml = xml.replace("</w:p>", "\n").replace("<w:br/>", "\n")
+        text = re.sub(r"<[^>]+>", "", xml)
+        return _html.unescape(text).strip()
+
+    def transcribe_document(
+        self,
+        document_path: str,
+        phone: str = "",
+        file_name: str = "",
+        mimetype: str = "",
+    ) -> str:
+        """Read/transcribe a document (PDF, DOCX, plain text) into text.
+
+        PDFs go to the configured ``document_model`` via the OpenRouter-style
+        ``file`` content part (the model handles both digital and scanned PDFs).
+        DOCX and plain-text files are extracted locally with stdlib — no LLM
+        call needed. Unsupported formats (legacy .doc, spreadsheets, …) return
+        an empty string so the caller falls back to just the document label.
+        """
+        try:
+            p = Path(document_path)
+            if not p.is_absolute():
+                p = Path(__file__).resolve().parent.parent / p
+            if not p.exists():
+                logger.warning("Document not found for transcription: %s", document_path)
+                return ""
+
+            kind = self._doc_kind(file_name, p, mimetype)
+
+            if kind == "docx":
+                result = self._extract_docx_text(p)[: self._DOC_TEXT_LIMIT].strip()
+                if result:
+                    track_step("media_processed", {
+                        "type": "document", "model": "local-docx",
+                        "transcription_length": len(result),
+                    })
+                    logger.info("Document (docx) extracted (%d chars)", len(result))
+                return result
+
+            if kind == "text":
+                try:
+                    result = p.read_text(encoding="utf-8", errors="ignore")
+                except Exception as e:
+                    logger.warning("Text document read failed for %s: %s", p, e)
+                    return ""
+                result = result[: self._DOC_TEXT_LIMIT].strip()
+                if result:
+                    track_step("media_processed", {
+                        "type": "document", "model": "local-text",
+                        "transcription_length": len(result),
+                    })
+                    logger.info("Document (text) read (%d chars)", len(result))
+                return result
+
+            if kind != "pdf":
+                logger.info("Document type unsupported for transcription: %s (%s)",
+                            file_name or document_path, mimetype)
+                return ""
+
+            # PDF → LLM file input.
+            if not self.api_key:
+                return ""
+            data = p.read_bytes()
+            b64 = base64.b64encode(data).decode()
+            client = self._get_client()
+            response = client.chat.completions.create(
+                model=self.document_model,
+                timeout=120,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": file_name or p.name or "document.pdf",
+                                "file_data": f"data:application/pdf;base64,{b64}",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extraia e transcreva todo o conteúdo textual deste "
+                                "documento em português brasileiro, incluindo tabelas e "
+                                "dados relevantes de forma organizada. Retorne apenas o "
+                                "conteúdo do documento, sem comentários adicionais."
+                            ),
+                        },
+                    ],
+                }],
+                max_tokens=4096,
+            )
+            self._record_usage(phone, "document", self.document_model, response)
+            result = (response.choices[0].message.content or "").strip()
+            track_step("media_processed", {
+                "type": "document",
+                "model": self.document_model,
+                "transcription_length": len(result),
+            })
+            logger.info("Document transcribed (%d chars): %s", len(result), result[:80])
+            return result
+        except Exception as e:
+            logger.error("Document transcription failed: %s", e)
+            track_step("error", {"error": str(e), "phase": "document_transcription"}, status="error")
+            return ""
+
     def _get_contact(self, phone: str) -> ContactMemory:
         if phone not in self._contacts:
             self._contacts[phone] = ContactMemory(phone, default_ai_enabled=self.default_ai_enabled)
         return self._contacts[phone]
 
-    def _build_system_prompt(self, contact: ContactMemory) -> str:
-        """Build system prompt with contact info and current date/time injected."""
-        prompt = self.system_prompt
+    def _select_active_tools(self, agent_spec) -> list[dict]:
+        """Return the effective tool schemas, restricted to the agent's selection.
+
+        When the DB-driven agent declares ``tool_names`` (a list), only those
+        tools are exposed; ``None`` (or no spec) means every registered tool —
+        identical to the legacy behaviour. Plugin ``filter.llm.tools`` runs
+        afterwards on whatever subset this returns.
+        """
+        if agent_spec is None or agent_spec.tool_names is None:
+            return list(self._tool_schemas)
+        wanted = set(agent_spec.tool_names)
+        return [
+            s for s in self._tool_schemas
+            if (s.get("function") or {}).get("name") in wanted
+        ]
+
+    @staticmethod
+    def _encode_history_for_split(context_messages: list[dict]) -> list[dict]:
+        """Re-encode assistant turns as JSON arrays for the split_messages format.
+
+        When split_messages is on, the model is asked to answer with a JSON array
+        of strings. But the assistant history is stored already split into clean
+        plain text, so the model SEES its own past turns as plain text and mimics
+        that pattern — drifting out of the JSON format. The presence of tools
+        amplifies this drift dramatically (measured: 1/10 vs 15/15 success).
+
+        Fix: present each assistant turn to the model in the SAME JSON-array shape
+        it must produce. Consecutive assistant messages (one turn's split parts)
+        are merged into a single array, mirroring one real response. Only the
+        LLM-facing copy is changed — stored history and panel display are intact.
+        """
+        out: list[dict] = []
+        buffer: list[str] = []
+
+        def flush() -> None:
+            if buffer:
+                out.append({"role": "assistant",
+                            "content": json.dumps(buffer, ensure_ascii=False)})
+                buffer.clear()
+
+        for m in context_messages:
+            if m.get("role") == "assistant" and isinstance(m.get("content"), str):
+                buffer.append(m.get("content") or "")
+            else:
+                flush()
+                out.append(m)
+        flush()
+        return out
+
+    def _build_system_prompt(self, contact: ContactMemory,
+                             base_prompt: str | None = None) -> str:
+        """Build system prompt with contact info and current date/time injected.
+
+        ``base_prompt`` overrides ``self.system_prompt`` as the starting text
+        (config-in-DB path); the dynamic sections (group context, contact info,
+        tags, date, plugin fragments, split-messages format) layer on top
+        unchanged in both paths.
+        """
+        prompt = base_prompt if base_prompt is not None else self.system_prompt
         if contact.is_group:
             gname = f" chamado '{contact.group_name}'" if contact.group_name else ""
             prompt += (
@@ -435,6 +706,23 @@ class AgentHandler:
                 "de forma natural ao grupo.\n"
                 "--- Fim do contexto de grupo ---"
             )
+            # Inject participant names so the AI can @mention a specific member.
+            try:
+                members = group_mentions.get_members(contact.phone)
+            except Exception:
+                members = []
+            named = [m["name"] for m in members if m.get("name")]
+            if named:
+                prompt += (
+                    "\n\n--- Mencionar participantes ---\n"
+                    "Para mencionar alguém do grupo, escreva @ seguido do nome "
+                    "EXATAMENTE como aparece nesta lista — o sistema converte "
+                    "automaticamente para a menção real do WhatsApp:\n"
+                    + ", ".join(f"@{n}" for n in named)
+                    + "\nMencione apenas quando fizer sentido se dirigir a uma "
+                    "pessoa específica; não mencione todo mundo sem necessidade.\n"
+                    "--- Fim mencionar participantes ---"
+                )
         info_summary = contact.get_info_summary()
         if info_summary:
             prompt += (
@@ -497,22 +785,43 @@ class AgentHandler:
         )
         if self.split_messages:
             prompt += (
-                "\n\n--- Formato de resposta ---\n"
-                "IMPORTANTE: Você DEVE responder SEMPRE em formato JSON array de strings.\n"
-                "Cada string é uma mensagem separada que será enviada no WhatsApp.\n"
-                "Regras:\n"
-                "- Seja DIRETO e CONCISO. Não enrole. Responda apenas o necessário.\n"
-                "- Respostas curtas e simples: USE APENAS 1 MENSAGEM (array com 1 elemento)\n"
-                "- Só divida em múltiplas mensagens quando a resposta total for LONGA (mais de 4-5 linhas)\n"
-                "- Quando dividir: máximo 2 a 3 partes, cada uma com 1-3 linhas\n"
-                "- NÃO separe saudação do conteúdo se a resposta for curta\n"
-                "- NÃO use markdown nem formatação especial\n"
-                "Exemplos:\n"
+                "\n\n--- FORMATO DE SAÍDA (OBRIGATÓRIO) ---\n"
+                "Sua resposta INTEIRA deve ser UM array JSON de strings — nada mais.\n"
+                "O PRIMEIRO caractere da sua saída é '[' e o ÚLTIMO é ']'.\n"
+                "Cada string do array vira uma mensagem separada no WhatsApp.\n"
+                "\n"
+                "PROIBIDO (quebra o sistema):\n"
+                "- Escrever qualquer coisa fora do array (sem texto antes do '[' nem depois do ']').\n"
+                "- Usar separadores entre mensagens: nada de '---', 'response', '\\n\\n', bullets, números.\n"
+                "  A ÚNICA forma de separar mensagens é criar outro elemento (string) no MESMO array.\n"
+                "- Retornar vários arrays. É sempre UM único array, com um único '[' e um único ']'.\n"
+                "- Markdown, títulos ou formatação especial dentro das strings.\n"
+                "\n"
+                "Como dividir:\n"
+                "- Cada mensagem deve ser CURTA (1 a 3 linhas). Mensagens grandes ficam horríveis.\n"
+                "- Resposta simples = array com 1 elemento só. Não separe a saudação do conteúdo curto.\n"
+                "- Dados distintos (link, chave PIX, valor, instrução) = cada um em seu próprio elemento.\n"
+                "\n"
+                "EXEMPLO de como a sua resposta DEVE ser.\n"
+                "Se você fosse mandar isto (NÃO faça assim, é uma só mensagem gigante):\n"
+                "  Ótimo! Já vou te mandar o link do e-book.\n"
+                "  https://exemplo.com/ebook\n"
+                "  Faça o PIX de R$27 pra liberar o acesso.\n"
+                "  Chave: f765ce68-49ba-4c08-9624-8b1fd63779b2\n"
+                "  Aparece como: Techify\n"
+                "  Quando pagar, me manda o print que eu confiro.\n"
+                "Você DEVE responder assim (array JSON, cada parte uma mensagem curta):\n"
+                '[\"Ótimo! Já vou te mandar o link do e-book.\", '
+                '\"https://exemplo.com/ebook\", '
+                '\"Faça o PIX de R$27 pra liberar o acesso.\", '
+                '\"Chave: f765ce68-49ba-4c08-9624-8b1fd63779b2\", '
+                '\"Aparece como: Techify\", '
+                '\"Quando pagar, me manda o print que eu confiro.\"]\n'
+                "\n"
+                "Mais exemplos:\n"
                 'Resposta curta: [\"Ok, só um minuto!\"]\n'
-                'Resposta longa: [\"Então, sobre o plano mensal...\", '
-                '\"O valor é R$99 e inclui X, Y e Z\", \"Quer que eu te mande o link?\"]\n'
-                "Retorne APENAS o JSON array, sem texto antes ou depois.\n"
-                "--- Fim do formato ---"
+                'Resposta média: [\"Sobre o plano mensal:\", \"São R$99 e inclui X, Y e Z.\", \"Quer o link?\"]\n'
+                "--- FIM DO FORMATO ---"
             )
         return prompt
 
@@ -545,8 +854,17 @@ class AgentHandler:
             contact.add_message("user", text or "", media_type=media_type, media_path=media_path)
 
         context_messages = contact.get_context_messages(self.max_context_messages)
+        if self.split_messages:
+            context_messages = self._encode_history_for_split(context_messages)
 
-        system_prompt_str = self._build_system_prompt(contact)
+        # Config-in-DB: resolve the DB-driven agent for this contact (or None to
+        # use the in-code prompt/model/tools — full parity when the flag is off).
+        agent_spec = agent_factory.build_for_contact(self, contact)
+        model = (agent_spec.model_config.get("model") if agent_spec else None) or self.model
+        model_config = agent_spec.model_config if agent_spec else None
+        base_prompt = agent_spec.base_prompt if agent_spec else None
+
+        system_prompt_str = self._build_system_prompt(contact, base_prompt=base_prompt)
         system_prompt_str = await apply_filter(
             "filter.system_prompt", system_prompt_str, {"phone": sender}
         )
@@ -563,7 +881,7 @@ class AgentHandler:
         if messages is None:
             return ProcessResult(reply="")
 
-        active_tools = [] if disable_tools else list(self._tool_schemas)
+        active_tools = [] if disable_tools else self._select_active_tools(agent_spec)
         active_tools = await apply_filter(
             "filter.llm.tools", active_tools, {"phone": sender}
         )
@@ -571,24 +889,10 @@ class AgentHandler:
             active_tools = []
 
         try:
-            client = self._get_async_client()
-            track_step("llm_request", {
-                "model": self.model,
-                "context_messages": len(messages) - 1,
-                "tools": [t["function"]["name"] for t in active_tools],
-            })
-            create_kwargs = {
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": 1024,
-            }
-            if active_tools:
-                create_kwargs["tools"] = active_tools
-                create_kwargs["tool_choice"] = "auto"
             _llm_t0 = time.monotonic()
             await emit_with_filter("llm.before", {
                 "phone": sender,
-                "model": self.model,
+                "model": model,
                 "message_count": len(messages),
                 "has_tools": bool(active_tools),
                 "tool_count": len(active_tools),
@@ -596,94 +900,26 @@ class AgentHandler:
                 "audio_path": audio_path,
                 "ts": time.time(),
             })
-            response = await client.chat.completions.create(**create_kwargs)
 
-            self._record_usage(sender, "text", self.model, response)
-            usage = response.usage
-            track_step("llm_response", {
-                "model": self.model,
-                "prompt_tokens": usage.prompt_tokens if usage else 0,
-                "completion_tokens": usage.completion_tokens if usage else 0,
-                "has_tool_calls": bool(response.choices[0].message.tool_calls),
-            })
-            msg = response.choices[0].message
+            # Delegate the reasoning + tool-calling loop to the AGNO engine.
+            # Tool filters/events (filter.tool.args/result, tool.before/after)
+            # are applied inside the wrapped tool entrypoints; usage is reported
+            # via AGNO RunMetrics rather than an OpenAI response object.
+            result = await agno_engine.run_async(
+                self, contact, sender, messages, active_tools,
+                model_config=model_config,
+            )
+            reply = result.reply
+            executed_tools = result.executed_tools
+            usage_dict = result.usage
 
-            executed_tools: list[dict] = []
-            tool_feedbacks: dict[str, str] = {}
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tool_name = tc.function.name
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError as e:
-                        logger.warning("Failed to parse tool args for %s: %s", sender, e)
-                        args = {}
-
-                    filtered_args = await apply_filter(
-                        "filter.tool.args",
-                        {"tool_name": tool_name, "args": args},
-                        {"phone": sender},
-                    )
-                    if filtered_args is None:
-                        # Filter vetoed this tool call.
-                        executed_tools.append({"tool": tool_name, "args": args, "skipped": True})
-                        tool_feedbacks[tc.id] = ""
-                        continue
-                    tool_name = filtered_args.get("tool_name", tool_name)
-                    args = filtered_args.get("args", args)
-
-                    _tool_t0 = time.monotonic()
-                    await emit_with_filter("tool.before", {
-                        "phone": sender, "tool_name": tool_name, "args": args,
-                        "ts": time.time(),
-                    })
-                    feedback = self._dispatch_tool(contact, tool_name, args)
-                    await emit_with_filter("tool.after", {
-                        "phone": sender, "tool_name": tool_name, "args": args,
-                        "result": feedback, "error": None,
-                        "latency_ms": int((time.monotonic() - _tool_t0) * 1000),
-                        "ts": time.time(),
-                    })
-                    if feedback is not None:
-                        filtered_result = await apply_filter(
-                            "filter.tool.result", feedback,
-                            {"phone": sender, "tool_name": tool_name},
-                        )
-                        feedback = "" if filtered_result is None else filtered_result
-                    if feedback:
-                        tool_feedbacks[tc.id] = feedback
-
-                    executed_tools.append({"tool": tool_name, "args": args})
-                    track_step("tool_executed", {"tool": tool_name, "args": args})
-                    logger.info("Tool call for %s: %s(%s)", sender, tool_name, args)
-
-                if not msg.content:
-                    messages.append(msg.model_dump())
-                    for tc in msg.tool_calls:
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": tool_feedbacks.get(tc.id, "Informações salvas com sucesso."),
-                        })
-                    track_step("llm_request", {"model": self.model, "type": "followup"})
-                    follow_up = await client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        max_tokens=1024,
-                    )
-                    self._record_usage(sender, "text", self.model, follow_up)
-                    fu_usage = follow_up.usage
-                    track_step("llm_response", {
-                        "model": self.model,
-                        "type": "followup",
-                        "prompt_tokens": fu_usage.prompt_tokens if fu_usage else 0,
-                        "completion_tokens": fu_usage.completion_tokens if fu_usage else 0,
-                    })
-                    reply = follow_up.choices[0].message.content.strip()
-                else:
-                    reply = msg.content.strip()
-            else:
-                reply = msg.content.strip()
+            if usage_dict:
+                self._record_usage_tokens(
+                    sender, "text", model,
+                    usage_dict.get("prompt_tokens", 0),
+                    usage_dict.get("completion_tokens", 0),
+                    usage_dict.get("total_tokens", 0),
+                )
 
             if save_response:
                 contact.add_message("assistant", reply)
@@ -694,16 +930,9 @@ class AgentHandler:
                 updated_info = dict(contact.info)
                 updated_info["observations"] = list(updated_info.get("observations", []))
 
-            usage_dict = None
-            if usage:
-                usage_dict = {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-                }
             await emit_with_filter("llm.after", {
                 "phone": sender,
-                "model": self.model,
+                "model": model,
                 "reply": reply,
                 "tool_calls": executed_tools,
                 "usage": usage_dict,
@@ -719,7 +948,7 @@ class AgentHandler:
             logger.error("LLM error for %s: %s", sender, e)
             track_step("error", {"error": str(e), "phase": "llm_call"}, status="error")
             await emit_with_filter("llm.after", {
-                "phone": sender, "model": self.model,
+                "phone": sender, "model": model,
                 "reply": "", "tool_calls": [], "usage": None,
                 "error": str(e),
                 "latency_ms": int((time.monotonic() - locals().get("_llm_t0", time.monotonic())) * 1000),
@@ -758,8 +987,17 @@ class AgentHandler:
             contact.add_message("user", text or "", media_type=media_type, media_path=media_path)
 
         context_messages = contact.get_context_messages(self.max_context_messages)
+        if self.split_messages:
+            context_messages = self._encode_history_for_split(context_messages)
 
-        system_prompt_str = self._build_system_prompt(contact)
+        # Config-in-DB: resolve the DB-driven agent for this contact (or None to
+        # use the in-code prompt/model/tools — full parity when the flag is off).
+        agent_spec = agent_factory.build_for_contact(self, contact)
+        model = (agent_spec.model_config.get("model") if agent_spec else None) or self.model
+        model_config = agent_spec.model_config if agent_spec else None
+        base_prompt = agent_spec.base_prompt if agent_spec else None
+
+        system_prompt_str = self._build_system_prompt(contact, base_prompt=base_prompt)
         system_prompt_str = apply_filter_sync(
             "filter.system_prompt", system_prompt_str, {"phone": sender}
         )
@@ -776,7 +1014,7 @@ class AgentHandler:
         if messages is None:
             return ProcessResult(reply="")
 
-        active_tools = [] if disable_tools else list(self._tool_schemas)
+        active_tools = [] if disable_tools else self._select_active_tools(agent_spec)
         active_tools = apply_filter_sync(
             "filter.llm.tools", active_tools, {"phone": sender}
         )
@@ -784,118 +1022,34 @@ class AgentHandler:
             active_tools = []
 
         try:
-            client = self._get_client()
-            track_step("llm_request", {
-                "model": self.model,
-                "context_messages": len(messages) - 1,
-                "tools": [t["function"]["name"] for t in active_tools],
-            })
-            create_kwargs = {
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": 1024,
-            }
-            if active_tools:
-                create_kwargs["tools"] = active_tools
-                create_kwargs["tool_choice"] = "auto"
             _llm_t0 = time.monotonic()
             emit_with_filter_sync("llm.before", {
-                "phone": sender, "model": self.model,
+                "phone": sender, "model": model,
                 "message_count": len(messages),
                 "has_tools": bool(active_tools),
                 "tool_count": len(active_tools),
                 "image_path": image_path, "audio_path": audio_path,
                 "ts": time.time(),
             })
-            response = client.chat.completions.create(**create_kwargs)
 
-            self._record_usage(sender, "text", self.model, response)
-            usage = response.usage
-            track_step("llm_response", {
-                "model": self.model,
-                "prompt_tokens": usage.prompt_tokens if usage else 0,
-                "completion_tokens": usage.completion_tokens if usage else 0,
-                "has_tool_calls": bool(response.choices[0].message.tool_calls),
-            })
-            msg = response.choices[0].message
+            # Delegate the reasoning + tool-calling loop to the AGNO engine.
+            # Tool filters/events run inside the wrapped tool entrypoints; usage
+            # is reported via AGNO RunMetrics.
+            result = agno_engine.run_sync(
+                self, contact, sender, messages, active_tools,
+                model_config=model_config,
+            )
+            reply = result.reply
+            executed_tools = result.executed_tools
+            usage_dict = result.usage
 
-            # Handle tool calls via the registry
-            executed_tools: list[dict] = []
-            tool_feedbacks: dict[str, str] = {}
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tool_name = tc.function.name
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError as e:
-                        logger.warning("Failed to parse tool args for %s: %s", sender, e)
-                        args = {}
-
-                    filtered_args = apply_filter_sync(
-                        "filter.tool.args",
-                        {"tool_name": tool_name, "args": args},
-                        {"phone": sender},
-                    )
-                    if filtered_args is None:
-                        executed_tools.append({"tool": tool_name, "args": args, "skipped": True})
-                        tool_feedbacks[tc.id] = ""
-                        continue
-                    tool_name = filtered_args.get("tool_name", tool_name)
-                    args = filtered_args.get("args", args)
-
-                    _tool_t0 = time.monotonic()
-                    emit_with_filter_sync("tool.before", {
-                        "phone": sender, "tool_name": tool_name, "args": args,
-                        "ts": time.time(),
-                    })
-                    feedback = self._dispatch_tool(contact, tool_name, args)
-                    emit_with_filter_sync("tool.after", {
-                        "phone": sender, "tool_name": tool_name, "args": args,
-                        "result": feedback, "error": None,
-                        "latency_ms": int((time.monotonic() - _tool_t0) * 1000),
-                        "ts": time.time(),
-                    })
-                    if feedback is not None:
-                        filtered_result = apply_filter_sync(
-                            "filter.tool.result", feedback,
-                            {"phone": sender, "tool_name": tool_name},
-                        )
-                        feedback = "" if filtered_result is None else filtered_result
-                    if feedback:
-                        tool_feedbacks[tc.id] = feedback
-
-                    executed_tools.append({"tool": tool_name, "args": args})
-                    track_step("tool_executed", {"tool": tool_name, "args": args})
-                    logger.info("Tool call for %s: %s(%s)", sender, tool_name, args)
-
-                # If model only called tools without text, do a follow-up call
-                if not msg.content:
-                    messages.append(msg.model_dump())
-                    for tc in msg.tool_calls:
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": tool_feedbacks.get(tc.id, "Informações salvas com sucesso."),
-                        })
-                    track_step("llm_request", {"model": self.model, "type": "followup"})
-                    follow_up = client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        max_tokens=1024,
-                    )
-                    self._record_usage(sender, "text", self.model, follow_up)
-                    fu_usage = follow_up.usage
-                    track_step("llm_response", {
-                        "model": self.model,
-                        "type": "followup",
-                        "prompt_tokens": fu_usage.prompt_tokens if fu_usage else 0,
-                        "completion_tokens": fu_usage.completion_tokens if fu_usage else 0,
-                    })
-                    reply = follow_up.choices[0].message.content.strip()
-                else:
-                    reply = msg.content.strip()
-            else:
-                reply = msg.content.strip()
+            if usage_dict:
+                self._record_usage_tokens(
+                    sender, "text", model,
+                    usage_dict.get("prompt_tokens", 0),
+                    usage_dict.get("completion_tokens", 0),
+                    usage_dict.get("total_tokens", 0),
+                )
 
             if save_response:
                 contact.add_message("assistant", reply)
@@ -908,15 +1062,8 @@ class AgentHandler:
                 # Deep copy observations list
                 updated_info["observations"] = list(updated_info.get("observations", []))
 
-            usage_dict = None
-            if usage:
-                usage_dict = {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-                }
             emit_with_filter_sync("llm.after", {
-                "phone": sender, "model": self.model, "reply": reply,
+                "phone": sender, "model": model, "reply": reply,
                 "tool_calls": executed_tools, "usage": usage_dict,
                 "latency_ms": int((time.monotonic() - _llm_t0) * 1000),
                 "ts": time.time(),
@@ -928,7 +1075,7 @@ class AgentHandler:
             logger.error("LLM error for %s: %s", sender, e)
             track_step("error", {"error": str(e), "phase": "llm_call"}, status="error")
             emit_with_filter_sync("llm.after", {
-                "phone": sender, "model": self.model,
+                "phone": sender, "model": model,
                 "reply": "", "tool_calls": [], "usage": None,
                 "error": str(e),
                 "latency_ms": int((time.monotonic() - locals().get("_llm_t0", time.monotonic())) * 1000),
@@ -945,7 +1092,7 @@ class AgentHandler:
         """Test if an API key is valid."""
         try:
             client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
+                base_url=LLM_API_BASE_URL,
                 api_key=api_key,
             )
             client.chat.completions.create(
@@ -967,10 +1114,12 @@ class AgentHandler:
 
     def save_operator_message(self, phone: str, text: str, *,
                               status: str | None = None,
-                              msg_id: str | None = None) -> dict:
+                              msg_id: str | None = None,
+                              reply_to_msg_id: str | None = None) -> dict:
         """Save a manually sent message (from the operator) without LLM processing."""
         contact = self._get_contact(phone)
-        contact.add_message("assistant", text, status=status, msg_id=msg_id)
+        contact.add_message("assistant", text, status=status, msg_id=msg_id,
+                            reply_to_msg_id=reply_to_msg_id)
         return message_repo.get_last(contact.id) or {"role": "assistant", "content": text, "ts": time.time()}
 
     def mark_message_sent(self, phone: str, content: str,

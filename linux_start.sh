@@ -20,7 +20,7 @@ export WHATSBOT_GOWA_PORT="${WHATSBOT_GOWA_PORT:-64998}"
 cd "$(dirname "$0")"
 
 # Versão do GOWA que casa com o cliente em gowa/client.py e o Dockerfile.
-GOWA_VERSION="${GOWA_VERSION:-8.5.0}"
+GOWA_VERSION="${GOWA_VERSION:-8.8.0}"
 
 require_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -95,6 +95,10 @@ free_port "$WHATSBOT_WEB_PORT"
 free_port "$WHATSBOT_GOWA_PORT"
 pkill -f "$(pwd)/bin/gowa" 2>/dev/null || true
 sleep 1
+
+# uvicorn valida cada --reload-dir antes de subir; numa instalação nova
+# storages/plugins ainda não existe (é criada em runtime por create_app).
+mkdir -p storages/plugins
 
 while true; do
     echo "[linux_start] $(date '+%H:%M:%S') starting uvicorn --reload (port $WHATSBOT_WEB_PORT)..."

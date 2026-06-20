@@ -10,17 +10,35 @@ import { LoginScreen } from './components/LoginScreen.js';
 import { PluginsManager } from './components/PluginsManager.js';
 import { PluginScreen } from './components/PluginScreen.js';
 import { ToolsManager } from './components/ToolsManager.js';
+import { SetupWizard } from './components/SetupWizard.js';
+import { LowBalanceModal } from './components/LowBalanceModal.js';
 import { useWebSocket } from './hooks/useWebSocket.js';
 import { useConfig } from './hooks/useConfig.js';
-import { checkAuth, authHeaders } from './services/api.js';
+import { checkAuth, authHeaders, getUnreadCount } from './services/api.js';
 import { playTransferAlert } from './utils/alertSound.js';
+import { getNotifPref, playNotificationSound, showBrowserNotification } from './utils/notifications.js';
+
+const LOW_BALANCE_SNOOZE_KEY = 'whatsbot_low_balance_snoozed_until';
+
+function lowBalanceIsSnoozed() {
+  try {
+    const v = parseInt(localStorage.getItem(LOW_BALANCE_SNOOZE_KEY) || '0', 10);
+    return v && Date.now() < v;
+  } catch { return false; }
+}
+
+function snoozeLowBalance(ms) {
+  try {
+    localStorage.setItem(LOW_BALANCE_SNOOZE_KEY, String(Date.now() + ms));
+  } catch {}
+}
 
 const html = htm.bind(h);
 
 // Core (built-in) routes. Plugin screens are merged in dynamically below.
 const CORE_ROUTES = {
   '/': 'contacts',
-  '/dashboard': 'dashboard',
+  '/painel': 'dashboard',
   '/sandbox': 'sandbox',
   '/costs': 'costs',
   '/executions': 'executions',
@@ -29,7 +47,7 @@ const CORE_ROUTES = {
 };
 const CORE_TAB_PATHS = {
   contacts: '/',
-  dashboard: '/dashboard',
+  dashboard: '/painel',
   sandbox: '/sandbox',
   costs: '/costs',
   executions: '/executions',
@@ -84,7 +102,7 @@ function MenuItem({ active, href, onClick, icon, children }) {
   `;
 }
 
-function GearMenu({ tab, onTabChange, pluginScreens, hasPassword, onLogout }) {
+function GearMenu({ tab, onTabChange, pluginScreens, hasPassword, onLogout, accountUrl }) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef(null);
 
@@ -98,18 +116,29 @@ function GearMenu({ tab, onTabChange, pluginScreens, hasPassword, onLogout }) {
 
   const close = () => setOpen(false);
 
+  // Dark mode: toggles `.dark` on <html> (re-themes the whole app via CSS
+  // variables) and persists the choice. The early script in index.html applies
+  // it before first paint so there's no flash on reload.
+  const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'));
+  function toggleDark() {
+    const next = !document.documentElement.classList.contains('dark');
+    document.documentElement.classList.toggle('dark', next);
+    try { localStorage.setItem('whatsbot_theme', next ? 'dark' : 'light'); } catch (e) {}
+    setDark(next);
+  }
+
   return html`
     <div ref=${menuRef} class="fixed top-3 right-3 z-50">
       <button
         onClick=${() => setOpen(!open)}
-        class="w-[36px] h-[36px] flex items-center justify-center rounded-full bg-white shadow-md border border-wa-border hover:bg-wa-hover transition-colors"
+        class="w-[36px] h-[36px] flex items-center justify-center rounded-full bg-wa-bg shadow-md border border-wa-border hover:bg-wa-hover transition-colors"
       >
         <svg viewBox="0 0 24 24" width="20" height="20" fill="#54656f">
           <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
         </svg>
       </button>
       ${open ? html`
-        <div class="absolute right-0 mt-1 bg-white rounded-lg shadow-lg border border-wa-border py-1 min-w-[180px] max-h-[80vh] overflow-y-auto">
+        <div class="absolute right-0 mt-1 bg-wa-bg rounded-lg shadow-lg border border-wa-border py-1 min-w-[180px] max-h-[80vh] overflow-y-auto">
           <${MenuItem} active=${tab === 'dashboard'} href=${CORE_TAB_PATHS.dashboard} onClick=${() => { onTabChange('dashboard'); close(); }}
             icon=${html`<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>`}
           >Painel</${MenuItem}>
@@ -140,12 +169,38 @@ function GearMenu({ tab, onTabChange, pluginScreens, hasPassword, onLogout }) {
           ` : null}
 
           <div class="border-t border-wa-border my-1"></div>
+          ${accountUrl ? html`
+            <a
+              href=${accountUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick=${close}
+              class="w-full text-left px-4 py-2.5 text-[14px] hover:bg-wa-hover transition-colors flex items-center gap-2 no-underline text-wa-text"
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 4H4c-1.11 0-1.99.89-1.99 2L2 18c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V6c0-1.11-.89-2-2-2zm0 14H4v-6h16v6zm0-10H4V6h16v2z"/></svg>
+              Saldo e Recargar
+            </a>
+          ` : null}
           <${MenuItem} active=${tab === 'tools'} href=${CORE_TAB_PATHS.tools} onClick=${() => { onTabChange('tools'); close(); }}
             icon=${html`<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/></svg>`}
           >Gerenciar Tools</${MenuItem}>
           <${MenuItem} active=${tab === 'plugins'} href=${CORE_TAB_PATHS.plugins} onClick=${() => { onTabChange('plugins'); close(); }}
             icon=${html`<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5C13 2.12 11.88 1 10.5 1S8 2.12 8 3.5V5H4c-1.1 0-1.99.9-1.99 2v3.8H3.5c1.49 0 2.7 1.21 2.7 2.7s-1.21 2.7-2.7 2.7H2V20c0 1.1.9 2 2 2h3.8v-1.5c0-1.49 1.21-2.7 2.7-2.7s2.7 1.21 2.7 2.7V22H17c1.1 0 2-.9 2-2v-4h1.5c1.38 0 2.5-1.12 2.5-2.5S21.88 11 20.5 11z"/></svg>`}
           >Gerenciar Plugins</${MenuItem}>
+
+          <div class="border-t border-wa-border my-1"></div>
+          <button
+            onClick=${toggleDark}
+            class="w-full text-left px-4 py-2.5 text-[14px] hover:bg-wa-hover transition-colors flex items-center gap-2 text-wa-text"
+          >
+            ${dark
+              ? html`<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zm0-5l2.39 3.42C13.65 5.15 12.84 5 12 5c-.84 0-1.65.15-2.39.42L12 2zM3.34 7l4.16-.35C6.84 7.28 6.31 8 5.91 8.81L3.34 7zm0 10l2.57-1.81c.4.81.93 1.53 1.59 2.16L3.34 17zM12 22l-2.39-3.42c.74.27 1.55.42 2.39.42.84 0 1.65-.15 2.39-.42L12 22zm8.66-5l-4.16.35c.66-.63 1.19-1.35 1.59-2.16L20.66 17zm0-10l-2.57 1.81c-.4-.81-.93-1.53-1.59-2.16L20.66 7z"/></svg>`
+              : html`<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 01-4.4 2.26 5.4 5.4 0 01-5.4-5.4c0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z"/></svg>`}
+            <span class="flex-1">Modo escuro</span>
+            <span class="w-9 h-5 rounded-full transition-colors relative shrink-0 ${dark ? 'bg-wa-teal' : 'bg-wa-border'}">
+              <span class="absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all ${dark ? 'left-[18px]' : 'left-0.5'}"></span>
+            </span>
+          </button>
 
           ${hasPassword ? html`
             <div class="border-t border-wa-border my-1"></div>
@@ -187,6 +242,7 @@ function App({ onLogout, hasPassword }) {
   const [wsConnected, setWsConnected] = useState(true);
   const [pluginScreens, setPluginScreens] = useState([]);
   const [tab, setTabState] = useState(() => tabFromPath([]));
+  const [unreadConvos, setUnreadConvos] = useState(0);  // conversations with unread msgs (tab-title badge)
   const [newMessage, setNewMessage] = useState(null);
   const [chatPresence, setChatPresence] = useState(null);
   const [contactInfoUpdated, setContactInfoUpdated] = useState(null);
@@ -195,7 +251,29 @@ function App({ onLogout, hasPassword }) {
   const [contactAiToggled, setContactAiToggled] = useState(null);
   const [messagesRead, setMessagesRead] = useState(null);
   const [messageStatus, setMessageStatus] = useState(null);
+  const [messageAction, setMessageAction] = useState(null);
+  const [messageReaction, setMessageReaction] = useState(null);
+  const [avatarUpdated, setAvatarUpdated] = useState(null);
+  const [groupParticipantsChanged, setGroupParticipantsChanged] = useState(null);
+  const [lowBalance, setLowBalance] = useState(null);
   const [initialContactId, setInitialContactId] = useState(contactIdFromPath);
+  const [wizardManual, setWizardManual] = useState(() => window.location.pathname === '/wizard');
+  const wizardLatchRef = useRef(false);
+
+  // Open/close the setup wizard, keeping the /wizard URL in sync so it can be
+  // reached directly (and bookmarked / shared).
+  const openWizard = useCallback(() => {
+    setWizardManual(true);
+    if (window.location.pathname !== '/wizard') history.pushState(null, '', '/wizard');
+  }, []);
+  const closeWizard = useCallback(() => {
+    wizardLatchRef.current = false;
+    setWizardManual(false);
+    if (window.location.pathname === '/wizard') {
+      history.pushState(null, '', '/');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }
+  }, []);
 
   // Fetch the public plugin manifest once at boot. Errors are non-fatal —
   // the core app keeps running even if plugins fail to load.
@@ -205,7 +283,9 @@ function App({ onLogout, hasPassword }) {
       .then(res => {
         if (!res || !res.ok) return;
         const screens = (res.data.plugins || []).flatMap(p =>
-          (p.screens || []).map(s => ({ ...s, pluginId: s.pluginId || p.id }))
+          (p.screens || [])
+            .filter(s => !s.config)  // config screens live in the Plugins tab, not the gear menu
+            .map(s => ({ ...s, pluginId: s.pluginId || p.id }))
         );
         setPluginScreens(screens);
         // Re-evaluate tab now that we know about plugin paths.
@@ -229,6 +309,7 @@ function App({ onLogout, hasPassword }) {
     function onPopState() {
       setTabState(tabFromPath(pluginScreens));
       setInitialContactId(contactIdFromPath());
+      setWizardManual(window.location.pathname === '/wizard');
     }
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
@@ -238,6 +319,15 @@ function App({ onLogout, hasPassword }) {
 
   const configRef = useRef(config);
   useEffect(() => { configRef.current = config; }, [config]);
+
+  // First run (no API key, setup not completed): reflect the wizard in the
+  // URL so a hard reload / share lands back on /wizard.
+  useEffect(() => {
+    const firstRun = config && config.setup_completed !== true && !config.openrouter_api_key;
+    if (firstRun && window.location.pathname !== '/wizard') {
+      history.replaceState(null, '', '/wizard');
+    }
+  }, [config]);
 
   useWebSocket({
     onStatus: useCallback((data) => setStatus(data), []),
@@ -261,9 +351,90 @@ function App({ onLogout, hasPassword }) {
     onContactAiToggled: useCallback((data) => setContactAiToggled(data), []),
     onMessagesRead: useCallback((data) => setMessagesRead(data), []),
     onMessageStatus: useCallback((data) => setMessageStatus(data), []),
+    onMessageAction: useCallback((data) => setMessageAction(data), []),
+    onMessageReaction: useCallback((data) => setMessageReaction(data), []),
+    onAvatarUpdated: useCallback((data) => setAvatarUpdated(data), []),
+    onGroupParticipantsChanged: useCallback((data) => setGroupParticipantsChanged({ ...data, _t: Date.now() }), []),
+    onLowBalance: useCallback((data) => {
+      if (lowBalanceIsSnoozed()) return;
+      setLowBalance(data);
+    }, []),
     onWsConnect: useCallback(() => setWsConnected(true), []),
     onWsDisconnect: useCallback(() => setWsConnected(false), []),
   });
+
+  // One-shot balance check on boot — covers the case where the app opens while
+  // already below the threshold but no LLM call has happened since the last
+  // broadcast. Skipped when the user has snoozed the popup.
+  useEffect(() => {
+    if (!config || !config.openrouter_api_key) return;
+    if (lowBalanceIsSnoozed()) return;
+    fetch('/api/balance', { headers: authHeaders() })
+      .then(r => r.json())
+      .then(res => {
+        if (res && res.ok && res.data && res.data.low_balance_enabled && res.data.below_threshold) {
+          setLowBalance({
+            remaining: res.data.remaining,
+            total_credits: res.data.total_credits,
+            total_usage: res.data.total_usage,
+            threshold: res.data.threshold,
+            account_url: res.data.account_url,
+          });
+        }
+      })
+      .catch(() => { /* ignore */ });
+  }, [config && config.openrouter_api_key]);
+
+  // ── Browser-tab unread badge ("(3) WhatsBot"), like WhatsApp Web ──────────
+  // Single source of truth is the backend count; we refresh it (debounced) on
+  // boot, on WS events that change unread state, and when the contacts list
+  // reports a change (e.g. the operator opened/read a chat — no WS event fires
+  // for that on the same client).
+  const unreadTimerRef = useRef(null);
+  const refreshUnreadCount = useCallback(() => {
+    if (unreadTimerRef.current) clearTimeout(unreadTimerRef.current);
+    unreadTimerRef.current = setTimeout(async () => {
+      try {
+        const res = await getUnreadCount();
+        if (res && res.ok) setUnreadConvos(res.data.count || 0);
+      } catch (_) { /* ignore */ }
+    }, 250);
+  }, []);
+
+  useEffect(() => { refreshUnreadCount(); }, [newMessage, messagesRead, refreshUnreadCount]);
+
+  // Bumped when notification prefs change in the config panel, so the effects
+  // below re-evaluate (e.g. turning the tab badge off should apply at once).
+  const [notifVersion, setNotifVersion] = useState(0);
+  useEffect(() => {
+    const onPrefs = () => setNotifVersion(v => v + 1);
+    window.addEventListener('whatsbot:notif-prefs', onPrefs);
+    return () => window.removeEventListener('whatsbot:notif-prefs', onPrefs);
+  }, []);
+
+  // Tab-title badge — gated by the "tab notification" preference.
+  useEffect(() => {
+    const tabBadge = getNotifPref('tab');
+    document.title = (tabBadge && unreadConvos > 0) ? `(${unreadConvos}) WhatsBot` : 'WhatsBot';
+  }, [unreadConvos, notifVersion]);
+
+  // Browser notification + sound on a new INBOUND message (from a contact).
+  // Sound plays whenever enabled; the desktop notification only shows when the
+  // tab isn't visible (you're away), like Telegram/WhatsApp Web.
+  useEffect(() => {
+    if (!newMessage) return;
+    const m = newMessage.message;
+    if (!m || m.role !== 'user') return;
+    if (getNotifPref('sound')) playNotificationSound();
+    const away = document.hidden || !document.hasFocus();
+    if (getNotifPref('browser') && away) {
+      let preview = (m.content || '').trim();
+      if (!preview) {
+        preview = m.media_type ? 'Enviou uma mídia' : 'Nova mensagem';
+      }
+      showBrowserNotification('WhatsBot — nova mensagem', preview.slice(0, 140));
+    }
+  }, [newMessage]);
 
   async function handleSave(data) {
     const result = await save(data);
@@ -282,6 +453,33 @@ function App({ onLogout, hasPassword }) {
     `;
   }
 
+  // First-run setup wizard — takes over the whole screen until completed.
+  // Also reopenable on demand via the "Refazer configuração" button on /painel.
+  // An install that already has an API key configured is NOT a first run —
+  // never ambush an existing/configured user with the wizard after an update.
+  const needsSetup = config
+    && config.setup_completed !== true
+    && !config.openrouter_api_key;
+  // Once opened, the wizard stays mounted until the user finishes or closes
+  // it — provisioning a key sets openrouter_api_key, which would otherwise
+  // flip needsSetup to false mid-flow and unmount the wizard before step 3.
+  if (needsSetup || wizardManual) wizardLatchRef.current = true;
+  if (wizardLatchRef.current) {
+    return html`<${SetupWizard}
+      status=${status}
+      qrAvailable=${qrAvailable}
+      qrVersion=${qrVersion}
+      config=${config}
+      canClose=${!needsSetup}
+      onClose=${closeWizard}
+      onConfigSave=${save}
+      onComplete=${async () => {
+        await save({ setup_completed: true });
+        closeWizard();
+      }}
+    />`;
+  }
+
   // Resolve plugin screen for the current tab id, if any.
   const activePluginScreen = (tab && tab.startsWith('plugin:'))
     ? pluginScreens.find(s => pluginTabId(s) === tab)
@@ -289,7 +487,7 @@ function App({ onLogout, hasPassword }) {
 
   return html`
     <div class="h-dvh overflow-hidden flex flex-col relative">
-      <${GearMenu} tab=${tab} onTabChange=${setTab} pluginScreens=${pluginScreens} hasPassword=${hasPassword} onLogout=${onLogout} />
+      <${GearMenu} tab=${tab} onTabChange=${setTab} pluginScreens=${pluginScreens} hasPassword=${hasPassword} onLogout=${onLogout} accountUrl=${config && config.account_url} />
 
       <main class="flex-1 min-h-0 overflow-auto ${tab !== 'contacts' ? 'bg-wa-panel' : ''}">
         ${activePluginScreen
@@ -309,7 +507,9 @@ function App({ onLogout, hasPassword }) {
                   fetch('/api/plugins/manifest', { headers: authHeaders() }).then(r => r.json()).then(res => {
                     if (res && res.ok) {
                       const sc = (res.data.plugins || []).flatMap(p =>
-                        (p.screens || []).map(s => ({ ...s, pluginId: s.pluginId || p.id }))
+                        (p.screens || [])
+                          .filter(s => !s.config)
+                          .map(s => ({ ...s, pluginId: s.pluginId || p.id }))
                       );
                       setPluginScreens(sc);
                     }
@@ -327,10 +527,11 @@ function App({ onLogout, hasPassword }) {
                     saving=${saving}
                     onSave=${handleSave}
                     onNotify=${handleNotify}
+                    onReopenSetup=${openWizard}
                   />
                 </div>`
               : tab === 'contacts'
-                ? html`<${Contacts} newMessage=${newMessage} chatPresence=${chatPresence} contactInfoUpdated=${contactInfoUpdated} tagsChanged=${tagsChanged} contactTagsUpdated=${contactTagsUpdated} contactAiToggled=${contactAiToggled} messagesRead=${messagesRead} messageStatus=${messageStatus} initialContactId=${initialContactId} wsConnected=${wsConnected} config=${config} onConfigSave=${save} />`
+                ? html`<${Contacts} newMessage=${newMessage} chatPresence=${chatPresence} contactInfoUpdated=${contactInfoUpdated} tagsChanged=${tagsChanged} contactTagsUpdated=${contactTagsUpdated} contactAiToggled=${contactAiToggled} messagesRead=${messagesRead} messageStatus=${messageStatus} messageAction=${messageAction} messageReaction=${messageReaction} avatarUpdated=${avatarUpdated} groupParticipantsChanged=${groupParticipantsChanged} initialContactId=${initialContactId} wsConnected=${wsConnected} config=${config} onConfigSave=${save} onUnreadChange=${refreshUnreadCount} />`
                 : tab === 'costs'
                   ? html`<div class="max-w-5xl mx-auto p-4">
                       <${PageHeader} title="Custos de IA" onBack=${() => setTab('contacts')} />
@@ -348,12 +549,17 @@ function App({ onLogout, hasPassword }) {
                         }} />
                         <${Executions} />
                       </div>`
-                    : html`<div class="max-w-5xl mx-auto p-4">
-                        <${PageHeader} title="Sandbox" onBack=${() => setTab('contacts')} />
-                        <${Sandbox} />
-                      </div>`
+                    : html`<${Sandbox} newMessage=${newMessage} />`
         }
       </main>
+
+      ${lowBalance ? html`<${LowBalanceModal}
+        balance=${lowBalance.remaining}
+        threshold=${lowBalance.threshold}
+        accountUrl=${lowBalance.account_url || (config && config.account_url)}
+        onClose=${() => setLowBalance(null)}
+        onSnooze=${(ms) => snoozeLowBalance(ms)}
+      />` : null}
     </div>
   `;
 }

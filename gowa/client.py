@@ -40,11 +40,11 @@ class GOWASendError(Exception):
 
     def __init__(self, message: str, error_type: str = "unknown"):
         super().__init__(message)
-        self.error_type = error_type  # network, api, unknown
+        self.error_type = error_type  # network, api, reachout_timelock, unknown
 
 
 class GOWAClient:
-    """HTTP client for the GOWA REST API (go-whatsapp-web-multidevice v8.5.0)."""
+    """HTTP client for the GOWA REST API (go-whatsapp-web-multidevice v8.8.0)."""
 
     def __init__(self, port: int = 3000, timeout: float = 15.0):
         self.base_url = f"http://127.0.0.1:{port}"
@@ -84,13 +84,28 @@ class GOWAClient:
             logger.error("GOWA HTTP %s %s -> %s", method, path, e.response.status_code)
             if raise_on_error:
                 status = e.response.status_code
-                # Try to extract error message from GOWA response
+                # Try to extract error message/code from GOWA response
                 detail = ""
+                code = ""
                 try:
                     body = e.response.json()
                     detail = body.get("message", body.get("error", ""))
+                    code = str(body.get("code", ""))
                 except Exception:
                     pass
+                # WhatsApp's server-side reach-out timelock (error 463): an
+                # anti-spam restriction on starting new chats. GOWA >= 8.8.0
+                # surfaces it as HTTP 429 / code WA_REACHOUT_TIMELOCK; older
+                # builds returned an opaque HTTP 500 "server returned error 463".
+                # It cannot be bypassed by the API — flag it so callers can show
+                # actionable guidance instead of a generic failure.
+                blob = f"{code} {detail}".lower()
+                if status == 429 or "reachout" in blob or "timelock" in blob \
+                        or "error 463" in blob:
+                    raise GOWASendError(
+                        detail or "WhatsApp recusou o envio (reach-out timelock, erro 463).",
+                        error_type="reachout_timelock",
+                    )
                 msg = f"Erro da API do WhatsApp (HTTP {status})"
                 if detail:
                     msg += f": {detail}"
@@ -175,6 +190,70 @@ class GOWAClient:
             return results.get("is_logged_in", results.get("is_connected", False))
         return False
 
+    def get_own_number(self) -> str:
+        """Best-effort: the connected account's own phone number (digits only).
+
+        GOWA does not expose the logged-in number consistently, so we probe
+        both /app/status and /devices for anything resembling a JID and
+        extract its user part. Returns "" if it can't be determined.
+        """
+        def _extract(value: object) -> str:
+            text = str(value or "")
+            if "@" not in text:
+                return ""
+            return text.split("@")[0].split(":")[0].strip()
+
+        try:
+            status = self.get_status()
+            if status and isinstance(status, dict):
+                results = status.get("results", status.get("data", status))
+                if isinstance(results, dict):
+                    for key in ("jid", "device", "phone", "id", "user"):
+                        num = _extract(results.get(key))
+                        if num:
+                            return num
+        except Exception as e:
+            logger.debug("get_own_number: /app/status probe failed: %s", e)
+
+        try:
+            for d in self.list_devices():
+                if not isinstance(d, dict):
+                    continue
+                for key in ("device", "jid", "phone", "id"):
+                    num = _extract(d.get(key))
+                    if num:
+                        return num
+        except Exception as e:
+            logger.debug("get_own_number: /devices probe failed: %s", e)
+
+        return ""
+
+    def get_own_display_name(self) -> str:
+        """Best-effort: the connected account's own WhatsApp profile name.
+
+        Read from GET /devices, where ``display_name`` is the name the account
+        holder set on WhatsApp (the "default name decided by the contact").
+        Prefers a logged-in device; falls back to the first named one. Returns
+        "" if it can't be determined.
+        """
+        try:
+            devices = self.list_devices()
+        except Exception as e:
+            logger.debug("get_own_display_name: /devices probe failed: %s", e)
+            return ""
+        chosen = ""
+        for d in devices:
+            if not isinstance(d, dict):
+                continue
+            name = (d.get("display_name") or "").strip()
+            if not name:
+                continue
+            if str(d.get("state", "")).lower() == "logged_in":
+                return name
+            if not chosen:
+                chosen = name
+        return chosen
+
     # ── QR Code / Login ──────────────────────────────────────────────
 
     def get_qr_code(self) -> bytes | None:
@@ -227,12 +306,22 @@ class GOWAClient:
             return phone
         return self._clean_phone(phone)
 
-    def send_message(self, phone: str, text: str) -> dict:
-        """Send a text message to a phone number or group. Raises GOWASendError on failure."""
+    def send_message(self, phone: str, text: str, mentions: list[str] | None = None,
+                     reply_message_id: str | None = None) -> dict:
+        """Send a text message to a phone number or group. Raises GOWASendError on failure.
+
+        ``mentions`` is an optional list of phone numbers to mention (and/or the
+        special keyword ``"@everyone"``), per GOWA's /send/message API.
+        ``reply_message_id`` quotes an existing message (GOWA msg_id) in the reply.
+        """
         payload = {
             "phone": self._format_target(phone),
             "message": text,
         }
+        if mentions:
+            payload["mentions"] = mentions
+        if reply_message_id:
+            payload["reply_message_id"] = reply_message_id
         return self._request("POST", "/send/message", raise_on_error=True, json=payload)
 
     def send_image(self, phone: str, image_path: str, caption: str = "") -> dict:
@@ -270,6 +359,50 @@ class GOWAClient:
             raise
         except Exception as e:
             raise GOWASendError(f"Erro ao enviar imagem: {e}", error_type="unknown")
+
+    def send_file(self, phone: str, file_path: str, caption: str = "",
+                  filename: str | None = None) -> dict:
+        """Send an arbitrary file (document) to a phone number or group via multipart/form-data.
+
+        Uses GOWA's POST /send/file endpoint. The ``filename`` arg is what the
+        recipient sees in WhatsApp; if omitted, falls back to the disk basename
+        (which may carry a timestamp prefix for collision avoidance).
+        Raises GOWASendError on failure.
+        """
+        phone = self._format_target(phone)
+        url = f"{self.base_url}/send/file"
+        send_name = filename or Path(file_path).name
+        mime = mimetypes.guess_type(send_name)[0] or "application/octet-stream"
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                with open(file_path, "rb") as f:
+                    files = {"file": (send_name, f, mime)}
+                    data = {"phone": phone}
+                    if caption:
+                        data["caption"] = caption
+                    resp = client.post(url, headers=self._headers, data=data, files=files)
+                    resp.raise_for_status()
+                    return resp.json() if resp.text else {}
+        except httpx.ConnectError:
+            raise GOWASendError(
+                "WhatsApp não está acessível. Verifique se o serviço está rodando.",
+                error_type="network",
+            )
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                body = e.response.json()
+                detail = body.get("message", body.get("error", ""))
+            except Exception:
+                pass
+            msg = f"Erro da API do WhatsApp (HTTP {e.response.status_code})"
+            if detail:
+                msg += f": {detail}"
+            raise GOWASendError(msg, error_type="api")
+        except GOWASendError:
+            raise
+        except Exception as e:
+            raise GOWASendError(f"Erro ao enviar arquivo: {e}", error_type="unknown")
 
     def send_audio(self, phone: str, audio_path: str) -> dict:
         """Send an audio file to a phone number or group via multipart/form-data. Raises GOWASendError on failure."""
@@ -320,6 +453,42 @@ class GOWAClient:
             logger.warning("mark_as_read failed for %s: %s", message_id, e)
             return None
 
+    # ── Delete / Revoke ────────────────────────────────────────────
+
+    def _message_jid(self, phone: str) -> str:
+        """Build the chat JID GOWA expects for per-message endpoints."""
+        if self._is_group_jid(phone):
+            return phone
+        return f"{self._clean_phone(phone)}@s.whatsapp.net"
+
+    def revoke_message(self, message_id: str, phone: str) -> dict | None:
+        """Delete a message for everyone (revoke). Best-effort, never raises."""
+        payload = {"phone": self._message_jid(phone)}
+        try:
+            return self._request("POST", f"/message/{message_id}/revoke", json=payload)
+        except Exception as e:
+            logger.warning("revoke_message failed for %s: %s", message_id, e)
+            return None
+
+    def delete_message(self, message_id: str, phone: str) -> dict | None:
+        """Delete a message for me only (local device). Best-effort, never raises."""
+        payload = {"phone": self._message_jid(phone)}
+        try:
+            return self._request("POST", f"/message/{message_id}/delete", json=payload)
+        except Exception as e:
+            logger.warning("delete_message failed for %s: %s", message_id, e)
+            return None
+
+    def react_to_message(self, message_id: str, phone: str, emoji: str) -> dict | None:
+        """React to a message with an emoji (empty string removes the reaction).
+        Best-effort, never raises."""
+        payload = {"phone": self._message_jid(phone), "emoji": emoji}
+        try:
+            return self._request("POST", f"/message/{message_id}/reaction", json=payload)
+        except Exception as e:
+            logger.warning("react_to_message failed for %s: %s", message_id, e)
+            return None
+
     # ── Presence ───────────────────────────────────────────────────
 
     def send_chat_presence(self, phone: str, action: str = "start") -> dict | None:
@@ -338,6 +507,22 @@ class GOWAClient:
         result = self._request("GET", f"/chats?limit={limit}")
         if result and isinstance(result, dict):
             # v8.5.0 nests list under results.data
+            results = result.get("results", {})
+            if isinstance(results, dict):
+                return results.get("data", []) or []
+            if isinstance(results, list):
+                return results
+        return []
+
+    def get_wa_contacts(self) -> list[dict]:
+        """Return the device's WhatsApp contact store: [{jid, name}].
+
+        ``name`` is the saved contact name (whatsmeow FullName) — empty for
+        numbers the account hasn't saved. Used to resolve group participants to
+        a display name without them having to message first.
+        """
+        result = self._request("GET", "/user/my/contacts")
+        if result and isinstance(result, dict):
             results = result.get("results", {})
             if isinstance(results, dict):
                 return results.get("data", []) or []
@@ -415,6 +600,27 @@ class GOWAClient:
             if isinstance(results, list):
                 return results
         return []
+
+    def get_message_filename(self, chat_jid: str, msg_id: str) -> str:
+        """Resolve a media message's original filename from GOWA chat storage.
+
+        GOWA's webhook omits the document filename when auto-download is
+        enabled (``buildAutoDownloadPayload`` sends only ``path``/``caption``
+        and the on-disk path is UUID-based, so the name can't be recovered
+        from it). But GOWA persists ``filename`` in its chat storage *before*
+        forwarding the webhook and exposes it via ``GET /chat/{jid}/messages``
+        — so we look the message up by id.
+        """
+        if not chat_jid or not msg_id:
+            return ""
+        try:
+            messages = self.get_chat_messages(chat_jid, limit=25)
+        except Exception:
+            return ""
+        for m in messages:
+            if isinstance(m, dict) and str(m.get("id", "")) == str(msg_id):
+                return (m.get("filename") or "").strip()
+        return ""
 
     # ── Phone Check ────────────────────────────────────────────────
 

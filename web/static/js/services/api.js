@@ -75,6 +75,16 @@ export async function refreshQr() {
   return request('POST', '/api/qr/refresh');
 }
 
+// ── Setup wizard ───────────────────────────────────────────────────
+
+export async function setupRequestKey() {
+  return request('POST', '/api/setup/request-key');
+}
+
+export async function setupKeyStatus() {
+  return request('GET', '/api/setup/key-status');
+}
+
 // ── Sandbox ────────────────────────────────────────────────────────
 
 export async function sandboxSend(phone, message) {
@@ -85,6 +95,38 @@ export async function sandboxClear(phone) {
   return request('POST', '/api/sandbox/clear', { phone: phone || '' });
 }
 
+async function _sandboxUpload(path, fields) {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(fields)) {
+    if (value instanceof Blob) form.append(key, value, value.name || 'file');
+    else form.append(key, value ?? '');
+  }
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: _authHeaders(),
+    body: form,
+  });
+  if (res.status === 401) {
+    localStorage.removeItem('whatsbot_token');
+    window.dispatchEvent(new Event('whatsbot:unauthorized'));
+    return { ok: false, error: 'Não autenticado.' };
+  }
+  return res.json();
+}
+
+export async function sandboxSendImage(phone, file, caption = '') {
+  return _sandboxUpload('/api/sandbox/send-image', { phone, caption, image: file });
+}
+
+export async function sandboxSendAudio(phone, blob, filename = 'voice.ogg') {
+  const named = blob instanceof File ? blob : new File([blob], filename, { type: blob.type || 'audio/ogg' });
+  return _sandboxUpload('/api/sandbox/send-audio', { phone, audio: named });
+}
+
+export async function sandboxSendDocument(phone, file, caption = '') {
+  return _sandboxUpload('/api/sandbox/send-document', { phone, caption, document: file });
+}
+
 // ── Contacts ──────────────────────────────────────────────────────
 
 export async function getContacts(q = '', archived = false) {
@@ -93,6 +135,11 @@ export async function getContacts(q = '', archived = false) {
   if (q) params.push(`q=${encodeURIComponent(q)}`);
   const query = params.length ? `?${params.join('&')}` : '';
   return request('GET', `/api/contacts${query}`);
+}
+
+// Number of conversations with unread messages (for the browser-tab badge).
+export async function getUnreadCount() {
+  return request('GET', '/api/contacts/unread-count');
 }
 
 export async function getContact(phone, markRead = true) {
@@ -108,12 +155,33 @@ export async function archiveContact(phone, archived) {
   return request('POST', `/api/contacts/${encodeURIComponent(phone)}/archive`, { archived });
 }
 
-export async function sendMessage(phone, message) {
-  return request('POST', `/api/contacts/${encodeURIComponent(phone)}/send`, { message });
+export async function pinContact(phone, pinned) {
+  return request('POST', `/api/contacts/${encodeURIComponent(phone)}/pin`, { pinned });
+}
+
+export async function sendMessage(phone, message, replyTo = null) {
+  const body = { message };
+  if (replyTo) body.reply_to = replyTo;
+  return request('POST', `/api/contacts/${encodeURIComponent(phone)}/send`, body);
 }
 
 export async function retrySend(phone, message) {
   return request('POST', `/api/contacts/${encodeURIComponent(phone)}/retry-send`, { message });
+}
+
+// Delete a message. scope='me' (local) or scope='all' (revoke for everyone).
+// Pass msgId (GOWA id) and/or dbId (DB row id, for local messages without a msg_id).
+export async function deleteMessage(phone, { msgId = null, dbId = null, scope = 'me' } = {}) {
+  return request('POST', `/api/contacts/${encodeURIComponent(phone)}/messages/delete`, {
+    msg_id: msgId, db_id: dbId, scope,
+  });
+}
+
+// React to a message with an emoji. Empty emoji removes the operator's reaction.
+export async function reactToMessage(phone, msgId, emoji) {
+  return request('POST', `/api/contacts/${encodeURIComponent(phone)}/messages/react`, {
+    msg_id: msgId, emoji,
+  });
 }
 
 export async function sendPrivateMessage(phone, text, opts = {}) {
@@ -127,12 +195,29 @@ export async function markAsRead(phone) {
   return request('POST', `/api/contacts/${encodeURIComponent(phone)}/read`);
 }
 
+export async function markAsUnread(phone) {
+  return request('POST', `/api/contacts/${encodeURIComponent(phone)}/unread`);
+}
+
+export async function markAllUnread() {
+  return request('POST', `/api/contacts/mark-all-unread`);
+}
+
+export async function markAllRead() {
+  return request('POST', `/api/contacts/mark-all-read`);
+}
+
 export async function updateContactInfo(phone, info) {
   return request('PUT', `/api/contacts/${encodeURIComponent(phone)}/info`, info);
 }
 
 export async function toggleContactAI(phone, enabled) {
   return request('POST', `/api/contacts/${encodeURIComponent(phone)}/toggle-ai`, { enabled });
+}
+
+export async function getGroupMembers(groupJid, force = false) {
+  const qs = force ? '?force=true' : '';
+  return request('GET', `/api/contacts/${encodeURIComponent(groupJid)}/members${qs}`);
 }
 
 export async function sendImage(phone, file, caption = '') {
@@ -156,6 +241,23 @@ export async function sendAudio(phone, blob, filename = 'voice.ogg') {
   const form = new FormData();
   form.append('audio', blob, filename);
   const res = await fetch(`${BASE}/api/contacts/${encodeURIComponent(phone)}/send-audio`, {
+    method: 'POST',
+    headers: _authHeaders(),
+    body: form,
+  });
+  if (res.status === 401) {
+    localStorage.removeItem('whatsbot_token');
+    window.dispatchEvent(new Event('whatsbot:unauthorized'));
+    return { ok: false, error: 'Não autenticado.' };
+  }
+  return res.json();
+}
+
+export async function sendDocument(phone, file, caption = '') {
+  const form = new FormData();
+  form.append('document', file);
+  form.append('caption', caption);
+  const res = await fetch(`${BASE}/api/contacts/${encodeURIComponent(phone)}/send-document`, {
     method: 'POST',
     headers: _authHeaders(),
     body: form,

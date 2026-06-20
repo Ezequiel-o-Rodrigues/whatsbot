@@ -15,8 +15,10 @@ from server.auth import auth_required, verify_token
 from server.helpers import _get_web_dir
 from server.state import MemoryLogHandler, ConnectionManager, AppState
 from server.background import start_gowa_task, status_poll_loop, qr_poll_loop, avatar_fetch_task
-from server.routes import logs, sandbox, config, whatsapp, websocket, usage, contacts, webhook, auth, tags, executions, update, plugins as plugins_routes, tools as tools_routes, admin as admin_routes
+from server.routes import logs, sandbox, config, whatsapp, websocket, usage, contacts, webhook, auth, tags, executions, update, setup as setup_routes, plugins as plugins_routes, tools as tools_routes, admin as admin_routes, ai_engine as ai_engine_routes
 from db.repositories import tool_override_repo
+from agent import group_mentions, agent_factory
+from agent import ai_tool_installer
 from plugins.loader import bootstrap_initial_plugins, discover_and_load, PluginRegistry
 from plugins.context import set_runtime as _set_plugin_runtime
 from plugins.events import (
@@ -25,6 +27,7 @@ from plugins.events import (
     register_plugin_filters,
     emit as emit_event,
 )
+from server.balance_monitor import set_runtime as _set_balance_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +101,20 @@ def create_app(
         if loaded.filters:
             register_plugin_filters(loaded.id, loaded.filters)
 
+    # AI engine (config-in-DB + code-in-DB). Seed the default agent/prompt from
+    # the current config (idempotent), then materialise/install/register the
+    # DB-defined tools. Tools are registered AFTER core + plugin tools so the
+    # registry's collision no-op gives precedence to code over the DB. Both
+    # steps are best-effort: a failure never blocks the app from booting.
+    try:
+        agent_factory.seed_default_agent(settings)
+    except Exception as e:
+        logger.warning("AI engine seed failed: %s", e)
+    try:
+        ai_tool_installer.install_and_register(agent_handler, settings.data_dir)
+    except Exception as e:
+        logger.warning("AI tool installer failed: %s", e)
+
     # Tool override cleanup: drop rows for tools that no longer exist (renamed
     # in core, or belonging to a plugin that was removed). Then build the
     # effective tool list applied to the LLM.
@@ -122,6 +139,9 @@ def create_app(
         plugins_registry=registry,
     )
 
+    # Group @mention resolution service (members lookup + name/number mapping).
+    group_mentions.init(gowa_client)
+
     # ── GOWA restart callback ──────────────────────────────────────────
     def _on_gowa_restart():
         gowa_client.reset()
@@ -141,6 +161,7 @@ def create_app(
         _loop = asyncio.get_running_loop()
         _set_plugin_runtime(ws_manager, _loop)
         _set_events_runtime(_loop, agent_handler)
+        _set_balance_runtime(ws_manager, _loop, settings)
         # Lifecycle: plugins finished loading + bus is live, now broadcast
         for loaded in registry.loaded.values():
             emit_event("plugin.loaded", {
@@ -207,7 +228,7 @@ def create_app(
         if s.get("path", "").startswith("/")
     }
     _SPA_PATHS = (
-        {"/", "/dashboard", "/sandbox", "/costs", "/executions", "/plugins", "/tools"}
+        {"/", "/painel", "/sandbox", "/costs", "/executions", "/plugins", "/tools", "/wizard"}
         | _PLUGIN_SPA_PATHS
     )
 
@@ -251,7 +272,7 @@ def create_app(
             "worker-src 'self' blob:; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
-            "media-src 'self' blob:; "
+            "media-src 'self' data: blob:; "
             "connect-src 'self' ws: wss:; "
             "frame-ancestors 'none'"
         )
@@ -266,12 +287,13 @@ def create_app(
     # ── Frontend routes ────────────────────────────────────────────────
 
     @app.get("/")
-    @app.get("/dashboard")
+    @app.get("/painel")
     @app.get("/sandbox")
     @app.get("/costs")
     @app.get("/executions")
     @app.get("/plugins")
     @app.get("/tools")
+    @app.get("/wizard")
     @app.get("/contacts/{contact_id:int}")
     @app.get("/executions/{execution_id:int}")
     async def index(contact_id: int | None = None, execution_id: int | None = None):
@@ -300,6 +322,7 @@ def create_app(
     sandbox.register_routes(app, deps)
     config.register_routes(app, deps)
     whatsapp.register_routes(app, deps)
+    setup_routes.register_routes(app, deps)
     websocket.register_routes(app, deps)
     usage.register_routes(app, deps)
     contacts.register_routes(app, deps)
@@ -309,6 +332,7 @@ def create_app(
     plugins_routes.register_routes(app, deps)
     tools_routes.register_routes(app, deps)
     admin_routes.register_routes(app, deps)
+    ai_engine_routes.register_routes(app, deps)
 
     # ── Plugin routers and static assets ──────────────────────────────
     for loaded in registry.loaded.values():

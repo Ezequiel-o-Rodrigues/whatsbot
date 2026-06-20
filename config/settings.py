@@ -12,17 +12,42 @@ def get_data_dir() -> Path:
     return data_dir
 
 
+# LLM API base URL — OpenRouter-compatible proxy. Override via the
+# LLM_API_BASE_URL env var to point back at OpenRouter or another proxy.
+LLM_API_BASE_URL = os.environ.get(
+    "LLM_API_BASE_URL", "https://llm.techify.one/api/v1"
+).rstrip("/")
+
+# Techify account provisioning — used by the first-run setup wizard. The
+# WhatsBot fetches the current provisioning number from TECHIFY_SERVICE_NUMBER_URL
+# and sends a WhatsApp message to it, Techify creates an account + API key, and
+# the wizard polls TECHIFY_REQUEST_APIKEY_URL (keyed by the connected WhatsApp
+# number) until the key is ready. Once the account is created the key stays
+# downloadable for ~1 minute. TECHIFY_PROVISION_NUMBER is a fallback used only
+# when the service-number endpoint is unreachable.
+TECHIFY_SERVICE_NUMBER_URL = os.environ.get(
+    "TECHIFY_SERVICE_NUMBER_URL", "https://llm.techify.one/service_number"
+).rstrip("/")
+TECHIFY_PROVISION_NUMBER = os.environ.get("TECHIFY_PROVISION_NUMBER", "5513981744038")
+TECHIFY_REQUEST_APIKEY_URL = os.environ.get(
+    "TECHIFY_REQUEST_APIKEY_URL", "https://llm.techify.one/request-apikey"
+).rstrip("/")
+TECHIFY_PROVISION_MESSAGE = "Quero Criar conta e receber minha Chave de API"
+
+
 _ENV_OVERRIDES: dict[str, tuple[str, Callable[[str], Any]]] = {
     "OPENROUTER_API_KEY": ("openrouter_api_key", str),
     "WHATSBOT_MODEL": ("model", str),
     "WHATSBOT_AUDIO_MODEL": ("audio_model", str),
     "WHATSBOT_IMAGE_MODEL": ("image_model", str),
+    "WHATSBOT_DOCUMENT_MODEL": ("document_model", str),
     "WHATSBOT_SYSTEM_PROMPT": ("system_prompt", str),
     "WHATSBOT_WEB_PORT": ("web_port", int),
     "WHATSBOT_GOWA_PORT": ("gowa_port", int),
     "WHATSBOT_AUTO_REPLY": ("auto_reply", lambda v: v.lower() in ("1", "true", "yes")),
     "WHATSBOT_MAX_CONTEXT": ("max_context_messages", int),
     "WHATSBOT_BATCH_DELAY": ("message_batch_delay", float),
+    "WHATSBOT_AI_ENGINE": ("ai_engine_enabled", lambda v: v.lower() in ("1", "true", "yes")),
 }
 
 # Reverse lookup: config_key -> (env_key, cast). Used by get() to apply env overrides on-demand.
@@ -33,8 +58,9 @@ _ENV_OVERRIDES_BY_KEY: dict[str, tuple[str, Callable[[str], Any]]] = {
 DEFAULT_CONFIG = {
     "openrouter_api_key": "",
     "model": "deepseek/deepseek-v4-pro",
-    "audio_model": "google/gemini-3-flash-preview",
-    "image_model": "google/gemini-3-flash-preview",
+    "audio_model": "google/gemini-2.5-flash",
+    "image_model": "google/gemini-2.5-flash",
+    "document_model": "google/gemini-2.5-flash",
     "system_prompt": (
         "Você é um assistente útil e amigável. Responda de forma clara e concisa. "
         "Use português brasileiro."
@@ -54,14 +80,33 @@ DEFAULT_CONFIG = {
     "audio_transcription_target": "private",
     "audio_transcription_chat_prefix": "",
     "image_transcription_enabled": True,
+    "document_transcription_enabled": True,
     "transfer_alert_enabled": True,
     "transfer_alert_duration": 5,
     "group_reply_mode": "mention_only",
+    # --- Motor de agente dirigido pelo banco (config-in-DB + code-in-DB) -----
+    # Quando ``ai_engine_enabled`` é True, prompt/modelo/tools do agente são
+    # lidos do banco (tabelas ``ai_*``) em vez das constantes do AgentHandler,
+    # e tools podem ser criadas/editadas como código Python no próprio banco.
+    # Off (default) → caminho legado intacto (paridade total). Override por env
+    # ``WHATSBOT_AI_ENGINE``.
+    "ai_engine_enabled": False,
     "bot_phone": "",
     "bot_name": "",
     "default_ai_enabled": True,
     "web_password_hash": "",
     "web_password_salt": "",
+    "setup_completed": False,
+    # Techify account — returned by /request-apikey alongside the API key.
+    # account_url is the customer's account/recharge page; access_token is
+    # the credential for that account (kept server-side only).
+    "account_url": "",
+    "access_token": "",
+    # Low-balance notification — broadcast a "low_balance" WS event when the
+    # remaining OpenRouter credit drops below the threshold (USD). The frontend
+    # opens a modal pointing to ``account_url`` for the user to recharge.
+    "low_balance_enabled": True,
+    "low_balance_threshold": 0.50,
 }
 
 
@@ -89,6 +134,14 @@ class Settings:
         # Persist defaults for any key missing in the DB
         missing = {k: v for k, v in DEFAULT_CONFIG.items() if k not in current}
         if missing:
+            # An install that already has an API key configured is NOT a
+            # first run — seed setup_completed=True so the setup wizard does
+            # not ambush existing users after an update.
+            if "setup_completed" in missing:
+                env_key = os.environ.get("OPENROUTER_API_KEY", "")
+                missing["setup_completed"] = bool(
+                    current.get("openrouter_api_key") or env_key
+                )
             config_repo.set_many(missing)
 
     @staticmethod

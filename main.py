@@ -65,7 +65,9 @@ def main():
         model=settings.get("model", "deepseek/deepseek-v4-pro"),
         audio_model=settings.get("audio_model", "google/gemini-3-flash-preview"),
         image_model=settings.get("image_model", "google/gemini-3-flash-preview"),
+        document_model=settings.get("document_model", "google/gemini-2.5-flash"),
         default_ai_enabled=settings.get("default_ai_enabled", True),
+        ai_engine_enabled=settings.get("ai_engine_enabled", False),
     )
 
     app = create_app(

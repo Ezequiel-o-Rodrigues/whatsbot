@@ -1,3 +1,12 @@
+// ── Avatar URL (with cache-busting version) ──────────────────────
+// `v` is the cached file's mtime (avatar_v from the API); appending it makes
+// the browser re-fetch when the photo changes instead of using the stale image.
+export function avatarUrl(phone, v) {
+  if (!phone) return null;
+  const base = `/statics/avatars/${phone}.jpg`;
+  return v ? `${base}?v=${v}` : base;
+}
+
 // ── Time formatting ──────────────────────────────────────────────
 
 export function formatTime(ts) {
@@ -23,6 +32,16 @@ export function isSameDay(tsA, tsB) {
   return a.getFullYear() === b.getFullYear()
     && a.getMonth() === b.getMonth()
     && a.getDate() === b.getDate();
+}
+
+// ── Messages ─────────────────────────────────────────────────────
+
+// True when two messages are the same logical message — used to dedupe a
+// WebSocket-delivered message against an optimistic/already-loaded bubble.
+export function isSameMessage(a, b) {
+  if (!a || !b || a.role !== b.role) return false;
+  if (a.ts === b.ts) return true;
+  return a.content === b.content && Math.abs((a.ts || 0) - (b.ts || 0)) < 30;
 }
 
 export function formatDateSeparator(ts) {

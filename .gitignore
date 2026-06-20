@@ -23,6 +23,9 @@ build/
 *.exe
 !bin/gowa.exe
 
+# Plugins exportados (.zip distribuído pela Loja, não versionado no core)
+*-plugin.zip
+
 # Linux GOWA binary (baixado/buildado localmente por dev; não trackeado)
 bin/gowa
 
@@ -32,3 +35,6 @@ data/
 # Plugin restart trigger (touched by plugins.restart at runtime)
 server/_reload_trigger.py
 .reload_sentinel
+
+# Planos de implementação (local, não versionado)
+PLANO_setup_wizard.md

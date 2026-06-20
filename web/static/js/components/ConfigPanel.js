@@ -1,7 +1,7 @@
 import { h } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import htm from 'htm';
-import { testApiKey, checkForUpdates, performUpdate } from '../services/api.js';
+import { testApiKey, checkForUpdates, performUpdate, markAllUnread, markAllRead } from '../services/api.js';
 import { ModelSelect } from './ModelSelect.js';
 import { DatabaseSettings } from './DatabaseSettings.js';
 
@@ -9,7 +9,7 @@ const html = htm.bind(h);
 
 function Section({ title, children }) {
   return html`
-    <div class="bg-white rounded-xl p-5 border border-wa-border shadow-sm">
+    <div class="bg-wa-bg rounded-xl p-5 border border-wa-border shadow-sm">
       ${title ? html`
         <h3 class="text-xs font-semibold text-wa-secondary uppercase tracking-wider mb-4">${title}</h3>
       ` : null}
@@ -23,8 +23,6 @@ function Section({ title, children }) {
 export function ConfigPanel({ config, saving, onSave, onNotify }) {
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('');
-  const [audioModel, setAudioModel] = useState('');
-  const [imageModel, setImageModel] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
   const [autoReply, setAutoReply] = useState(true);
   const [maxContext, setMaxContext] = useState(10);
@@ -35,10 +33,18 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
   const [audioTranscriptionTarget, setAudioTranscriptionTarget] = useState('private');
   const [audioTranscriptionChatPrefix, setAudioTranscriptionChatPrefix] = useState('');
   const [imageTranscriptionEnabled, setImageTranscriptionEnabled] = useState(true);
+  const [documentTranscriptionEnabled, setDocumentTranscriptionEnabled] = useState(true);
   const [transferAlertEnabled, setTransferAlertEnabled] = useState(true);
   const [transferAlertDuration, setTransferAlertDuration] = useState(5);
+  const [lowBalanceEnabled, setLowBalanceEnabled] = useState(true);
+  const [lowBalanceThreshold, setLowBalanceThreshold] = useState(0.5);
   const [maxExecutions, setMaxExecutions] = useState(200);
+  const [confirmUnreadAll, setConfirmUnreadAll] = useState(false);
+  const [markingAllUnread, setMarkingAllUnread] = useState(false);
+  const [confirmReadAll, setConfirmReadAll] = useState(false);
+  const [markingAllRead, setMarkingAllRead] = useState(false);
   const [defaultAiEnabled, setDefaultAiEnabled] = useState(true);
+  const [groupReplyMode, setGroupReplyMode] = useState('mention_only');
   const [testing, setTesting] = useState(false);
   const [webPassword, setWebPassword] = useState('');
   const [webPasswordConfirm, setWebPasswordConfirm] = useState('');
@@ -75,8 +81,6 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
     if (config) {
       setApiKey(''); // Don't show masked key in input
       setModel(config.model || '');
-      setAudioModel(config.audio_model || '');
-      setImageModel(config.image_model || '');
       setSystemPrompt(config.system_prompt || '');
       setAutoReply(config.auto_reply ?? true);
       setMaxContext(config.max_context_messages ?? 10);
@@ -87,10 +91,14 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
       setAudioTranscriptionTarget(config.audio_transcription_target ?? 'private');
       setAudioTranscriptionChatPrefix(config.audio_transcription_chat_prefix ?? '');
       setImageTranscriptionEnabled(config.image_transcription_enabled ?? true);
+      setDocumentTranscriptionEnabled(config.document_transcription_enabled ?? true);
       setTransferAlertEnabled(config.transfer_alert_enabled ?? true);
       setTransferAlertDuration(config.transfer_alert_duration ?? 5);
+      setLowBalanceEnabled(config.low_balance_enabled ?? true);
+      setLowBalanceThreshold(config.low_balance_threshold ?? 0.5);
       setMaxExecutions(config.max_executions ?? 200);
       setDefaultAiEnabled(config.default_ai_enabled ?? true);
+      setGroupReplyMode(config.group_reply_mode ?? 'mention_only');
     }
   }, [config]);
 
@@ -142,11 +150,43 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
     }
   };
 
+  async function handleMarkAllUnread() {
+    setMarkingAllUnread(true);
+    try {
+      const res = await markAllUnread();
+      if (res.ok) {
+        onNotify(`${res.data?.count ?? 0} conversa(s) marcada(s) como não lida(s).`);
+      } else {
+        onNotify(res.error || 'Erro ao marcar conversas.');
+      }
+    } catch (e) {
+      onNotify('Erro de conexão ao marcar conversas.');
+    } finally {
+      setMarkingAllUnread(false);
+      setConfirmUnreadAll(false);
+    }
+  }
+
+  async function handleMarkAllRead() {
+    setMarkingAllRead(true);
+    try {
+      const res = await markAllRead();
+      if (res.ok) {
+        onNotify(`${res.data?.count ?? 0} conversa(s) marcada(s) como lida(s).`);
+      } else {
+        onNotify(res.error || 'Erro ao marcar conversas.');
+      }
+    } catch (e) {
+      onNotify('Erro de conexão ao marcar conversas.');
+    } finally {
+      setMarkingAllRead(false);
+      setConfirmReadAll(false);
+    }
+  }
+
   async function handleSave() {
     const data = {
       model: model.trim() || 'deepseek/deepseek-v4-pro',
-      audio_model: audioModel.trim() || 'google/gemini-3-flash-preview',
-      image_model: imageModel.trim() || 'google/gemini-3-flash-preview',
       system_prompt: systemPrompt,
       auto_reply: autoReply,
       max_context_messages: parseInt(maxContext, 10) || 10,
@@ -157,10 +197,14 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
       audio_transcription_target: audioTranscriptionTarget,
       audio_transcription_chat_prefix: audioTranscriptionChatPrefix,
       image_transcription_enabled: imageTranscriptionEnabled,
+      document_transcription_enabled: documentTranscriptionEnabled,
       transfer_alert_enabled: transferAlertEnabled,
       transfer_alert_duration: parseInt(transferAlertDuration, 10) || 5,
+      low_balance_enabled: lowBalanceEnabled,
+      low_balance_threshold: isNaN(parseFloat(lowBalanceThreshold)) ? 0.5 : parseFloat(lowBalanceThreshold),
       max_executions: parseInt(maxExecutions, 10) || 200,
       default_ai_enabled: defaultAiEnabled,
+      group_reply_mode: groupReplyMode,
     };
     // Only include api_key if user typed a new one
     if (apiKey.trim()) {
@@ -188,7 +232,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
   }
 
   if (!config) {
-    return html`<div class="bg-white rounded-xl p-5 animate-pulse-slow text-wa-secondary border border-wa-border">Carregando...</div>`;
+    return html`<div class="bg-wa-bg rounded-xl p-5 animate-pulse-slow text-wa-secondary border border-wa-border">Carregando...</div>`;
   }
 
   return html`
@@ -215,13 +259,27 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
           />
           IA ativada por padrão para novos contatos
         </label>
+
+        <div>
+          <label class="block text-sm font-semibold text-wa-text mb-1">Resposta da IA em grupos</label>
+          <select
+            value=${groupReplyMode}
+            onChange=${(e) => setGroupReplyMode(e.target.value)}
+            class="w-full bg-wa-panel text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
+          >
+            <option value="mention_only">Somente quando o bot for mencionado</option>
+            <option value="always">Sempre (responder a todas as mensagens do grupo)</option>
+            <option value="never">Nunca (não responder em grupos)</option>
+          </select>
+          <span class="text-xs text-wa-secondary">Vale apenas para grupos com a IA ativada. "Somente quando mencionado" exige um @menção ao bot; "Sempre" responde a qualquer mensagem do grupo.</span>
+        </div>
       <//>
 
       <!-- Section: API e Modelos -->
       <${Section} title="API e Modelos">
         <!-- API Key -->
         <div>
-          <label class="block text-sm font-semibold text-wa-text mb-1">API Key OpenRouter</label>
+          <label class="block text-sm font-semibold text-wa-text mb-1">Chave de API Techify</label>
           <div class="flex gap-2">
             <input
               type="password"
@@ -257,38 +315,59 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
           />
         </div>
 
-        <!-- Audio & Image models -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div>
-            <label class="block text-sm font-semibold text-wa-text mb-1">Modelo transcrição áudio</label>
-            <${ModelSelect}
-              value=${audioModel}
-              onChange=${setAudioModel}
-              filterModality="audio"
-              placeholder="google/gemini-3-flash-preview"
-            />
-            <span class="text-xs text-wa-secondary">Modelo com suporte a áudio</span>
+        <!-- Image description toggle -->
+        <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${imageTranscriptionEnabled ? 'bg-green-50 border-green-200 hover:bg-green-100' : 'bg-wa-panel border-wa-border hover:bg-wa-hover'}">
+          <input
+            type="checkbox"
+            checked=${imageTranscriptionEnabled}
+            onChange=${(e) => setImageTranscriptionEnabled(e.target.checked)}
+            class="w-4 h-4 rounded border-wa-border accent-wa-teal mt-0.5"
+          />
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class=${imageTranscriptionEnabled ? 'text-green-600' : 'text-wa-secondary'}>
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <polyline points="21 15 16 10 5 21"/>
+              </svg>
+              <span class="text-sm font-semibold text-wa-text">Descrever imagem</span>
+              <span class="text-xs px-2 py-0.5 rounded-full ${imageTranscriptionEnabled ? 'bg-green-600 text-white' : 'bg-wa-secondary/20 text-wa-secondary'}">
+                ${imageTranscriptionEnabled ? 'Ativado' : 'Desativado'}
+              </span>
+            </div>
+            <span class="block text-xs text-wa-secondary mt-1">
+              Usa IA para descrever automaticamente o conteúdo de imagens recebidas pelo contato
+            </span>
           </div>
-          <div>
-            <label class="block text-sm font-semibold text-wa-text mb-1">Modelo descrição imagem</label>
-            <${ModelSelect}
-              value=${imageModel}
-              onChange=${setImageModel}
-              filterModality="image"
-              placeholder="google/gemini-3-flash-preview"
-            />
-            <span class="text-xs text-wa-secondary">Modelo com suporte a visão</span>
-            <label class="flex items-center gap-2 mt-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked=${imageTranscriptionEnabled}
-                onChange=${(e) => setImageTranscriptionEnabled(e.target.checked)}
-                class="accent-wa-teal w-4 h-4"
-              />
-              <span class="text-sm text-wa-text">Ativar transcrição de imagem</span>
-            </label>
+        </label>
+
+        <!-- Document transcription toggle -->
+        <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${documentTranscriptionEnabled ? 'bg-green-50 border-green-200 hover:bg-green-100' : 'bg-wa-panel border-wa-border hover:bg-wa-hover'}">
+          <input
+            type="checkbox"
+            checked=${documentTranscriptionEnabled}
+            onChange=${(e) => setDocumentTranscriptionEnabled(e.target.checked)}
+            class="w-4 h-4 rounded border-wa-border accent-wa-teal mt-0.5"
+          />
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class=${documentTranscriptionEnabled ? 'text-green-600' : 'text-wa-secondary'}>
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="16" y1="13" x2="8" y2="13"/>
+                <line x1="16" y1="17" x2="8" y2="17"/>
+                <polyline points="10 9 9 9 8 9"/>
+              </svg>
+              <span class="text-sm font-semibold text-wa-text">Ler documento</span>
+              <span class="text-xs px-2 py-0.5 rounded-full ${documentTranscriptionEnabled ? 'bg-green-600 text-white' : 'bg-wa-secondary/20 text-wa-secondary'}">
+                ${documentTranscriptionEnabled ? 'Ativado' : 'Desativado'}
+              </span>
+            </div>
+            <span class="block text-xs text-wa-secondary mt-1">
+              Usa IA para extrair o conteúdo de documentos recebidos (PDF, DOCX e arquivos de texto)
+            </span>
           </div>
-        </div>
+        </label>
 
         <!-- Audio transcription mode & target -->
         <div class="flex flex-col gap-3 p-3 bg-wa-panel rounded-lg border border-wa-border">
@@ -299,7 +378,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
               <select
                 value=${audioTranscriptionMode}
                 onChange=${(e) => setAudioTranscriptionMode(e.target.value)}
-                class="w-full bg-white text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
+                class="w-full bg-wa-bg text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
               >
                 <option value="received">Somente recebidas</option>
                 <option value="sent">Somente enviadas</option>
@@ -313,7 +392,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
                 value=${audioTranscriptionTarget}
                 onChange=${(e) => setAudioTranscriptionTarget(e.target.value)}
                 disabled=${audioTranscriptionMode === 'off'}
-                class="w-full bg-white text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none disabled:opacity-50"
+                class="w-full bg-wa-bg text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none disabled:opacity-50"
               >
                 <option value="private">Mensagem privada (só no painel)</option>
                 <option value="chat">Direto no chat (envia ao contato)</option>
@@ -328,7 +407,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
                 onInput=${(e) => setAudioTranscriptionChatPrefix(e.target.value)}
                 rows="2"
                 placeholder="Ex: 🎙 Transcrição: "
-                class="w-full bg-white text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none resize-none"
+                class="w-full bg-wa-bg text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none resize-none"
               ></textarea>
               <span class="text-xs text-wa-secondary">Texto colado antes da transcrição enviada ao chat. Deixe em branco para enviar só o texto.</span>
             </div>
@@ -336,11 +415,11 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
         </div>
       <//>
 
-      <!-- Section: System Prompt -->
-      <${Section} title="System Prompt">
+      <!-- Section: Comportamento da IA -->
+      <${Section} title="Comportamento da IA">
         <div class="flex-1 flex flex-col">
           <div class="flex items-center justify-between mb-1">
-            <label class="block text-sm font-semibold text-wa-text">Prompt</label>
+            <label class="block text-sm font-semibold text-wa-text">Instruções</label>
             <button
               type="button"
               onClick=${() => setPromptFullscreen(true)}
@@ -362,9 +441,9 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
       <!-- Fullscreen Prompt Editor -->
       ${promptFullscreen ? html`
         <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick=${(e) => { if (e.target === e.currentTarget) setPromptFullscreen(false); }}>
-          <div class="bg-white w-full h-full rounded-xl flex flex-col shadow-2xl overflow-hidden">
+          <div class="bg-wa-bg w-full h-full rounded-xl flex flex-col shadow-2xl overflow-hidden">
             <div class="flex items-center justify-between px-5 py-3 border-b border-wa-border">
-              <h2 class="text-sm font-semibold text-wa-text">System Prompt</h2>
+              <h2 class="text-sm font-semibold text-wa-text">Comportamento da IA</h2>
               <button
                 type="button"
                 onClick=${() => setPromptFullscreen(false)}
@@ -377,7 +456,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
             <textarea
               value=${systemPrompt}
               onInput=${(e) => setSystemPrompt(e.target.value)}
-              class="flex-1 w-full bg-white text-wa-text px-5 py-4 text-sm leading-relaxed focus:outline-none resize-none"
+              class="flex-1 w-full bg-wa-bg text-wa-text px-5 py-4 text-sm leading-relaxed focus:outline-none resize-none"
               autofocus
             ></textarea>
           </div>
@@ -437,7 +516,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
                 step="0.5"
                 value=${splitDelay}
                 onInput=${(e) => setSplitDelay(e.target.value)}
-                class="w-32 bg-white text-wa-text px-3 py-1.5 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
+                class="w-32 bg-wa-bg text-wa-text px-3 py-1.5 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
               />
             </div>
           ` : null}
@@ -465,10 +544,97 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
                 step="1"
                 value=${transferAlertDuration}
                 onInput=${(e) => setTransferAlertDuration(e.target.value)}
-                class="w-32 bg-white text-wa-text px-3 py-1.5 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
+                class="w-32 bg-wa-bg text-wa-text px-3 py-1.5 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
               />
             </div>
           ` : null}
+        </div>
+
+        <!-- Low balance alert -->
+        <div class="flex flex-col gap-2 p-3 bg-wa-panel rounded-lg border border-wa-border">
+          <label class="flex items-center gap-2 text-sm font-semibold text-wa-text cursor-pointer">
+            <input
+              type="checkbox"
+              checked=${lowBalanceEnabled}
+              onChange=${(e) => setLowBalanceEnabled(e.target.checked)}
+              class="w-4 h-4 rounded border-wa-border accent-wa-teal"
+            />
+            Avisar quando o saldo estiver acabando
+          </label>
+          <span class="text-xs text-wa-secondary">Exibe um pop-up no painel com link de recarga quando o saldo cair abaixo do limite</span>
+          ${lowBalanceEnabled ? html`
+            <div class="mt-1">
+              <label class="block text-xs font-medium text-wa-text mb-1">Limite (USD)</label>
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="0.01"
+                value=${lowBalanceThreshold}
+                onInput=${(e) => setLowBalanceThreshold(e.target.value)}
+                class="w-32 bg-wa-bg text-wa-text px-3 py-1.5 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
+              />
+              <span class="text-xs text-wa-secondary block mt-1">Padrão: 0.50 (50 centavos de dólar)</span>
+            </div>
+          ` : null}
+        </div>
+
+        <!-- Mark all read / unread -->
+        <div class="flex flex-col gap-2 p-3 bg-wa-panel rounded-lg border border-wa-border">
+          <label class="text-sm font-semibold text-wa-text">Marcar conversas</label>
+          <span class="text-xs text-wa-secondary">Reacende ou limpa o indicador verde de não lido no painel. Para uma conversa específica, use o botão direito sobre o contato na lista.</span>
+          ${confirmUnreadAll ? html`
+            <div class="mt-1 flex flex-col gap-2 p-3 rounded-lg bg-amber-50 border border-amber-300">
+              <span class="text-sm font-medium text-amber-800">Marcar TODAS as conversas como não lidas?</span>
+              <span class="text-xs text-amber-700">Reacende o indicador verde em todos os contatos do painel. Não afeta o WhatsApp do celular.</span>
+              <div class="flex gap-2 mt-1">
+                <button
+                  type="button"
+                  disabled=${markingAllUnread}
+                  onClick=${handleMarkAllUnread}
+                  class="px-4 py-2 rounded-lg text-sm font-medium bg-amber-600 text-white hover:opacity-90 disabled:opacity-50 transition-opacity"
+                >${markingAllUnread ? 'Marcando...' : 'Confirmar'}</button>
+                <button
+                  type="button"
+                  disabled=${markingAllUnread}
+                  onClick=${() => setConfirmUnreadAll(false)}
+                  class="px-4 py-2 rounded-lg text-sm font-medium bg-wa-bg text-wa-text border border-wa-border hover:bg-wa-hover disabled:opacity-50 transition-colors"
+                >Cancelar</button>
+              </div>
+            </div>
+          ` : confirmReadAll ? html`
+            <div class="mt-1 flex flex-col gap-2 p-3 rounded-lg bg-amber-50 border border-amber-300">
+              <span class="text-sm font-medium text-amber-800">Marcar TODAS as conversas como lidas?</span>
+              <span class="text-xs text-amber-700">Remove o indicador verde de não lido de todos os contatos do painel.</span>
+              <div class="flex gap-2 mt-1">
+                <button
+                  type="button"
+                  disabled=${markingAllRead}
+                  onClick=${handleMarkAllRead}
+                  class="px-4 py-2 rounded-lg text-sm font-medium bg-amber-600 text-white hover:opacity-90 disabled:opacity-50 transition-opacity"
+                >${markingAllRead ? 'Marcando...' : 'Confirmar'}</button>
+                <button
+                  type="button"
+                  disabled=${markingAllRead}
+                  onClick=${() => setConfirmReadAll(false)}
+                  class="px-4 py-2 rounded-lg text-sm font-medium bg-wa-bg text-wa-text border border-wa-border hover:bg-wa-hover disabled:opacity-50 transition-colors"
+                >Cancelar</button>
+              </div>
+            </div>
+          ` : html`
+            <div class="flex flex-wrap gap-2 mt-1">
+              <button
+                type="button"
+                onClick=${() => { setConfirmReadAll(false); setConfirmUnreadAll(true); }}
+                class="px-4 py-2 rounded-lg text-sm font-medium bg-wa-teal text-white hover:opacity-90 transition-opacity"
+              >Marcar todas como não lidas</button>
+              <button
+                type="button"
+                onClick=${() => { setConfirmUnreadAll(false); setConfirmReadAll(true); }}
+                class="px-4 py-2 rounded-lg text-sm font-medium bg-wa-bg text-wa-text border border-wa-border hover:bg-wa-hover transition-colors"
+              >Marcar todas como lidas</button>
+            </div>
+          `}
         </div>
       <//>
 
@@ -506,7 +672,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
               value=${webPassword}
               onInput=${(e) => setWebPassword(e.target.value)}
               placeholder=${config.has_password ? 'Nova senha (deixe vazio para manter)' : 'Definir senha'}
-              class="w-full bg-white text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
+              class="w-full bg-wa-bg text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none"
             />
             ${webPassword ? html`
               <input
@@ -514,7 +680,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
                 value=${webPasswordConfirm}
                 onInput=${(e) => setWebPasswordConfirm(e.target.value)}
                 placeholder="Confirmar senha"
-                class="w-full bg-white text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none ${webPassword && webPasswordConfirm && webPassword !== webPasswordConfirm ? 'border-red-400' : ''}"
+                class="w-full bg-wa-bg text-wa-text px-3 py-2 rounded-lg text-sm border border-wa-border focus:border-wa-teal focus:outline-none ${webPassword && webPasswordConfirm && webPassword !== webPasswordConfirm ? 'border-red-400' : ''}"
               />
               ${webPassword && webPasswordConfirm && webPassword !== webPasswordConfirm ? html`
                 <span class="text-xs text-red-500">As senhas não coincidem</span>
@@ -560,7 +726,7 @@ export function ConfigPanel({ config, saving, onSave, onNotify }) {
               <button
                 onClick=${fetchVersionInfo}
                 disabled=${checkingUpdate || updating}
-                class="px-3 py-2 bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-wa-text text-sm rounded-lg transition-colors"
+                class="px-3 py-2 bg-wa-panel hover:bg-wa-hover disabled:opacity-50 text-wa-text text-sm rounded-lg transition-colors"
                 title="Verificar atualizações"
               >
                 ${checkingUpdate ? '...' : 'Verificar'}

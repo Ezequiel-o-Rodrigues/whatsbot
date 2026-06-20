@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import htm from 'htm';
 import { PluginSettingsForm } from './PluginSettingsForm.js';
+import { PluginScreen } from './PluginScreen.js';
 import { authHeaders, handleUnauthorized } from '../services/api.js';
 
 const html = htm.bind(h);
@@ -24,14 +25,14 @@ function StatusBadge({ plugin }) {
   if (plugin.enabled && !plugin.loaded) {
     return html`<span class="px-2 py-0.5 rounded-full text-[11px] bg-yellow-100 text-yellow-800">Ativado (aguardando restart)</span>`;
   }
-  return html`<span class="px-2 py-0.5 rounded-full text-[11px] bg-gray-100 text-gray-600">Desativado</span>`;
+  return html`<span class="px-2 py-0.5 rounded-full text-[11px] bg-wa-panel text-wa-secondary">Desativado</span>`;
 }
 
 
 function RestartBanner() {
   return html`
     <div class="fixed inset-0 bg-black/40 z-[60] flex items-center justify-center">
-      <div class="bg-white rounded-lg shadow-xl p-6 max-w-sm">
+      <div class="bg-wa-bg rounded-lg shadow-xl p-6 max-w-sm">
         <div class="flex items-center gap-3">
           <div class="w-6 h-6 border-2 border-wa-teal border-t-transparent rounded-full animate-spin"></div>
           <div>
@@ -53,6 +54,7 @@ export function PluginsManager({ onPluginsChanged }) {
   const [settingsOpen, setSettingsOpen] = useState(null); // plugin id
   const [importing, setImporting] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const [exporting, setExporting] = useState({}); // { [pluginId]: pct (0-100) }
   const fileRef = useRef(null);
 
   async function load() {
@@ -119,12 +121,39 @@ export function PluginsManager({ onPluginsChanged }) {
     }
   }
 
+  function clearExporting(pid) {
+    setExporting(s => { const n = { ...s }; delete n[pid]; return n; });
+  }
+
   async function exportPlugin(pid) {
+    if (exporting[pid] != null) return; // already running
+    setExporting(s => ({ ...s, [pid]: 0 }));
     try {
       const r = await fetch(`/api/plugins/${pid}/export`, { headers: authHeaders() });
       if (r.status === 401) { handleUnauthorized(); throw new Error('Não autenticado.'); }
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const blob = await r.blob();
+
+      // Stream the body so we can report real download progress. Falls back to
+      // a plain blob if the browser can't expose the stream or size.
+      const total = Number(r.headers.get('content-length')) || 0;
+      let blob;
+      if (r.body && total > 0) {
+        const reader = r.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          setExporting(s => ({ ...s, [pid]: Math.min(99, Math.round((received / total) * 100)) }));
+        }
+        blob = new Blob(chunks, { type: 'application/zip' });
+      } else {
+        blob = await r.blob();
+      }
+      setExporting(s => ({ ...s, [pid]: 100 }));
+
       const cd = r.headers.get('content-disposition') || '';
       const m = cd.match(/filename="?([^";]+)"?/i);
       const filename = (m && m[1]) || `${pid}.zip`;
@@ -136,7 +165,11 @@ export function PluginsManager({ onPluginsChanged }) {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+
+      // Hold the full bar briefly so it's visible even for tiny plugins.
+      setTimeout(() => clearExporting(pid), 800);
     } catch (e) {
+      clearExporting(pid);
       alert(`Erro ao exportar: ${e.message || e}`);
     }
   }
@@ -164,6 +197,11 @@ export function PluginsManager({ onPluginsChanged }) {
   if (loading) return html`<div class="text-wa-secondary">Carregando plugins…</div>`;
   if (error) return html`<div class="text-red-600">Erro: ${error}</div>`;
 
+  // A plugin may ship a custom config UI as a screen flagged `config: true`
+  // (rendered in the modal below instead of the auto-generated settings form).
+  const cfgPlugin = settingsOpen ? plugins.find(p => p.id === settingsOpen) : null;
+  const cfgScreen = cfgPlugin ? (cfgPlugin.screens || []).find(s => s.config) : null;
+
   return html`
     <div>
       ${restarting ? html`<${RestartBanner} />` : null}
@@ -173,7 +211,13 @@ export function PluginsManager({ onPluginsChanged }) {
           API do core: ${apiVersion}
           · ${plugins.length} plugin${plugins.length === 1 ? '' : 's'}
         </div>
-        <div>
+        <div class="flex items-center gap-2">
+          <a
+            href="https://whatsbot.techify.one/plugins"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="px-3 py-1.5 bg-red-600 text-white rounded text-[14px] hover:bg-red-700"
+          >Loja de Plugins</a>
           <input type="file" ref=${fileRef} accept=".zip" class="hidden"
             onChange=${e => importPlugin(e.target.files && e.target.files[0])} />
           <button
@@ -195,7 +239,7 @@ export function PluginsManager({ onPluginsChanged }) {
         : html`
           <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
             ${plugins.map(p => html`
-              <div key=${p.id} class="bg-white border border-wa-border rounded-lg p-4">
+              <div key=${p.id} class="bg-wa-bg border border-wa-border rounded-lg p-4">
                 <div class="flex items-start justify-between gap-2">
                   <div>
                     <div class="font-medium text-[15px]">${p.name || p.id}</div>
@@ -208,6 +252,11 @@ export function PluginsManager({ onPluginsChanged }) {
                 </div>
                 ${p.description ? html`
                   <div class="text-[13px] mt-2 text-wa-text">${p.description}</div>
+                ` : null}
+                ${(p.dependencies && p.dependencies.length) ? html`
+                  <div class="text-[11px] mt-2 text-wa-secondary">
+                    📦 Instala ao ativar: ${p.dependencies.join(', ')}
+                  </div>
                 ` : null}
                 ${p.load_error ? html`
                   <div class="mt-2 text-[12px] text-red-700 bg-red-50 border border-red-100 rounded px-2 py-1 break-all">
@@ -226,33 +275,46 @@ export function PluginsManager({ onPluginsChanged }) {
                   >Configurar</button>
                   <button
                     onClick=${() => exportPlugin(p.id)}
-                    class="px-3 py-1 text-[13px] rounded bg-wa-panel border border-wa-border"
-                  >Exportar</button>
+                    disabled=${exporting[p.id] != null}
+                    class="px-3 py-1 text-[13px] rounded bg-wa-panel border border-wa-border disabled:opacity-50"
+                  >${exporting[p.id] != null ? 'Exportando…' : 'Exportar'}</button>
                   <button
                     onClick=${() => deletePlugin(p.id)}
                     class="px-3 py-1 text-[13px] rounded bg-red-50 text-red-700 border border-red-200"
                   >Deletar</button>
                 </div>
+                ${exporting[p.id] != null ? html`
+                  <div class="mt-3">
+                    <div class="flex items-center justify-between text-[11px] text-wa-secondary mb-1">
+                      <span>Exportando…</span>
+                      <span>${exporting[p.id]}%</span>
+                    </div>
+                    <div class="h-2 bg-wa-panel border border-wa-border rounded-full overflow-hidden">
+                      <div class="h-full bg-wa-teal transition-all duration-150"
+                           style=${`width:${exporting[p.id]}%`}></div>
+                    </div>
+                  </div>
+                ` : null}
               </div>
             `)}
           </div>`
       }
 
       ${settingsOpen ? html`
-        <div class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center"
-             onClick=${() => setSettingsOpen(null)}>
-          <div class="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] overflow-y-auto"
-               onClick=${e => e.stopPropagation()}>
+        <div class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center">
+          <div class="bg-wa-bg rounded-lg shadow-xl ${cfgScreen ? 'max-w-2xl' : 'max-w-lg'} w-full mx-4 max-h-[85vh] overflow-y-auto">
             <div class="border-b border-wa-border px-4 py-3 flex items-center justify-between">
-              <div class="font-medium">Configurações — ${settingsOpen}</div>
+              <div class="font-medium">Configurações — ${(cfgPlugin && cfgPlugin.name) || settingsOpen}</div>
               <button class="text-wa-secondary hover:text-wa-text"
                       onClick=${() => setSettingsOpen(null)}>×</button>
             </div>
             <div class="p-4">
-              <${PluginSettingsForm}
-                pluginId=${settingsOpen}
-                onSaved=${() => onPluginsChanged && onPluginsChanged()}
-              />
+              ${cfgScreen
+                ? html`<${PluginScreen} screen=${{ ...cfgScreen, pluginId: cfgPlugin.id }} />`
+                : html`<${PluginSettingsForm}
+                    pluginId=${settingsOpen}
+                    onSaved=${() => onPluginsChanged && onPluginsChanged()}
+                  />`}
             </div>
           </div>
         </div>
